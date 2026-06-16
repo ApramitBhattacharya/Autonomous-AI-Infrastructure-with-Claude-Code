@@ -1,0 +1,303 @@
+"""Core scaffolding logic for genesis.
+
+Creates and augments repositories with autonomous dev system scaffolding.
+"""
+
+import os
+import subprocess
+from pathlib import Path
+
+from jinja2 import Environment, FileSystemLoader
+
+TEMPLATES_DIR = Path(__file__).parent.parent.parent / "templates"
+
+# Placeholder for the adopter-local secrets file. Written once to
+# ~/.config/genesis/.env (never into a dev repo) and shared across every
+# project the adopter bootstraps. A dev repo's activate.sh sources it.
+LOCAL_ENV_TEMPLATE = """\
+# Genesis adopter-local secrets — ONE set, SHARED across ALL your genesis projects.
+# A single GitHub App backs every project you bootstrap, so you fill these in once,
+# here. A dev repo's `.genesis/scripts/activate.sh` then copies them into that
+# repo's GitHub Actions secrets
+# (ANTHROPIC_API_KEY / GENESIS_APP_ID / GENESIS_APP_PRIVATE_KEY) and enables it.
+#
+#   ANTHROPIC_API_KEY          your Anthropic API key (console.anthropic.com)
+#   GENESIS_GITHUB_APP_ID      the numeric App ID of your genesis GitHub App
+#   GENESIS_GITHUB_APP_SECRET  the App's private key — paste the FULL PEM,
+#                              including the BEGIN/END lines, between the quotes.
+
+ANTHROPIC_API_KEY=
+GENESIS_GITHUB_APP_ID=
+GENESIS_GITHUB_APP_SECRET="-----BEGIN RSA PRIVATE KEY-----
+...paste the full PEM here, keeping the BEGIN/END lines...
+-----END RSA PRIVATE KEY-----"
+"""
+
+
+def _genesis_config_dir() -> Path:
+    """Adopter-local config dir (override with GENESIS_CONFIG_DIR; mainly for tests)."""
+    override = os.environ.get("GENESIS_CONFIG_DIR")
+    return Path(override) if override else Path.home() / ".config" / "genesis"
+
+
+def ensure_local_env() -> Path:
+    """Create the adopter-local `.env` with placeholders if it doesn't exist yet.
+
+    The three secrets are identical for every project an adopter bootstraps, so
+    this lives once in `~/.config/genesis/.env` - never inside a dev repo. If the
+    file is already there (e.g. from a previous genesis project), it's left
+    untouched so the human only populates it once. Returns the env file path.
+    """
+    config_dir = _genesis_config_dir()
+    env_path = config_dir / ".env"
+    if env_path.exists():
+        return env_path
+    config_dir.mkdir(parents=True, exist_ok=True)
+    config_dir.chmod(0o700)
+    env_path.write_text(LOCAL_ENV_TEMPLATE)
+    env_path.chmod(0o600)
+    return env_path
+
+SEED_AGENTS = [
+    "orchestrator",
+    "human_interaction",
+    "evolver",
+]
+
+SEED_WORKFLOWS = [
+    "genesis-orchestrator.yml",
+    "genesis-events.yml",
+    "genesis-evolver.yml",
+    "genesis-push-trigger.yml",
+]
+
+SEED_SCRIPTS = [
+    "log.sh",
+    "issues.sh",
+    "activate.sh",
+]
+
+
+def _render_template(name: str, **kwargs: object) -> str:
+    env = Environment(
+        loader=FileSystemLoader(TEMPLATES_DIR),
+        keep_trailing_newline=True,
+    )
+    template = env.get_template(name)
+    return template.render(**kwargs)
+
+
+def _git(repo_path: Path, *args: str) -> None:
+    subprocess.run(
+        ["git", "-C", str(repo_path), *args],
+        check=True,
+        capture_output=True,
+    )
+
+
+def _write_file(path: Path, content: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(content)
+
+
+def _write_seed_agents(base: Path) -> None:
+    agents_dir = base / ".claude" / "agents"
+    agents_dir.mkdir(parents=True, exist_ok=True)
+    for agent in SEED_AGENTS:
+        src = TEMPLATES_DIR / "agents" / f"{agent}.md"
+        dst = agents_dir / f"{agent}.md"
+        dst.write_text(src.read_text())
+
+
+def _write_seed_workflows(base: Path) -> None:
+    workflows_dir = base / ".github" / "workflows"
+    workflows_dir.mkdir(parents=True, exist_ok=True)
+    for workflow in SEED_WORKFLOWS:
+        src = TEMPLATES_DIR / "workflows" / workflow
+        dst = workflows_dir / workflow
+        dst.write_text(src.read_text())
+
+
+def _write_seed_scripts(base: Path) -> None:
+    scripts_dir = base / ".genesis" / "scripts"
+    scripts_dir.mkdir(parents=True, exist_ok=True)
+    for script in SEED_SCRIPTS:
+        src = TEMPLATES_DIR / "scripts" / script
+        dst = scripts_dir / script
+        dst.write_text(src.read_text())
+        dst.chmod(0o755)
+
+
+def _write_settings(base: Path) -> None:
+    settings_path = base / ".claude" / "settings.json"
+    settings_path.parent.mkdir(parents=True, exist_ok=True)
+    src = TEMPLATES_DIR / "settings.json"
+    settings_path.write_text(src.read_text())
+
+
+def _write_genesis_config(
+    base: Path,
+    project_name: str,
+    goal: str,
+    target_repos: list[str] | None = None,
+) -> None:
+    content = _render_template(
+        "config.toml.j2",
+        project_name=project_name,
+        goal=goal,
+        target_repos=target_repos or [],
+    )
+    _write_file(base / ".genesis" / "config.toml", content)
+
+
+def _write_onboarding_issue(
+    base: Path,
+    project_name: str,
+    goal: str,
+    target_repos: list[str] | None = None,
+) -> None:
+    content = _render_template(
+        "onboarding_issue.md.j2",
+        project_name=project_name,
+        goal=goal,
+        target_repos=target_repos or [],
+    )
+    _write_file(base / ".genesis" / "onboarding.md", content)
+
+
+def scaffold_new_repo(
+    path: Path,
+    goal: str,
+    project_name: str,
+) -> None:
+    """Create a new repo with full dev system scaffolding (embedded)."""
+    ensure_local_env()
+    path.mkdir(parents=True, exist_ok=True)
+
+    subprocess.run(
+        ["git", "init", str(path)],
+        check=True,
+        capture_output=True,
+    )
+
+    # CLAUDE.md
+    claude_md = _render_template(
+        "claude_md.md.j2",
+        project_name=project_name,
+        goal=goal,
+        target_repos=[],
+    )
+    _write_file(path / "CLAUDE.md", claude_md)
+
+    # README.md
+    readme = _render_template(
+        "readme.md.j2",
+        project_name=project_name,
+        goal=goal,
+    )
+    _write_file(path / "README.md", readme)
+
+    # Seed agents, workflows, settings, config
+    _write_seed_agents(path)
+    _write_seed_workflows(path)
+    _write_settings(path)
+    _write_genesis_config(path, project_name, goal)
+    _write_seed_scripts(path)
+
+    # Onboarding issue
+    _write_onboarding_issue(path, project_name, goal)
+
+    # Initial commit
+    _git(path, "add", "-A")
+    _git(path, "commit", "-m", "Initial scaffold by genesis")
+
+
+def scaffold_existing_repo(
+    path: Path,
+    goal: str,
+    project_name: str,
+) -> None:
+    """Add dev system scaffolding to an existing repo (embedded)."""
+    if not (path / ".git").is_dir():
+        raise ValueError(f"{path} is not a git repository")
+
+    ensure_local_env()
+
+    # Check for existing CLAUDE.md
+    claude_md_path = path / "CLAUDE.md"
+    claude_md_content = _render_template(
+        "claude_md.md.j2",
+        project_name=project_name,
+        goal=goal,
+        target_repos=[],
+    )
+
+    if claude_md_path.exists():
+        # Append genesis section to existing CLAUDE.md
+        existing = claude_md_path.read_text()
+        separator = "\n\n---\n\n# Genesis Dev System\n\n"
+        claude_md_path.write_text(existing + separator + claude_md_content)
+    else:
+        _write_file(claude_md_path, claude_md_content)
+
+    # Seed agents, workflows, settings, config
+    _write_seed_agents(path)
+    _write_seed_workflows(path)
+    _write_settings(path)
+    _write_genesis_config(path, project_name, goal)
+    _write_seed_scripts(path)
+
+    # Onboarding issue
+    _write_onboarding_issue(path, project_name, goal)
+
+    # Commit
+    _git(path, "add", "-A")
+    _git(path, "commit", "-m", "Add genesis dev system scaffolding")
+
+
+def scaffold_external_dev_repo(
+    dev_path: Path,
+    target_repos: list[str],
+    goal: str,
+    project_name: str,
+) -> None:
+    """Create a separate dev repo that manages work across target repos."""
+    ensure_local_env()
+    dev_path.mkdir(parents=True, exist_ok=True)
+
+    subprocess.run(
+        ["git", "init", str(dev_path)],
+        check=True,
+        capture_output=True,
+    )
+
+    # CLAUDE.md with target repo references
+    claude_md = _render_template(
+        "claude_md.md.j2",
+        project_name=project_name,
+        goal=goal,
+        target_repos=target_repos,
+    )
+    _write_file(dev_path / "CLAUDE.md", claude_md)
+
+    # README.md
+    readme = _render_template(
+        "readme.md.j2",
+        project_name=project_name,
+        goal=goal,
+    )
+    _write_file(dev_path / "README.md", readme)
+
+    # Seed agents, workflows, settings, config
+    _write_seed_agents(dev_path)
+    _write_seed_workflows(dev_path)
+    _write_settings(dev_path)
+    _write_genesis_config(dev_path, project_name, goal, target_repos)
+    _write_seed_scripts(dev_path)
+
+    # Onboarding issue with target repo references
+    _write_onboarding_issue(dev_path, project_name, goal, target_repos)
+
+    # Initial commit
+    _git(dev_path, "add", "-A")
+    _git(dev_path, "commit", "-m", "Initial scaffold by genesis")
