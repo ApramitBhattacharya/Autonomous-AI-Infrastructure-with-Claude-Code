@@ -9,27 +9,31 @@ The snapshots are vendored as **plain files (no `.git`)**, pinned to the exact v
 
 ## Version per chapter
 
-Both repos share a tag scheme, and each chapter advances it by one.
+Each repo carries its own tag, and a chapter pins whichever tag each repo ends on. The two started in lockstep but now diverge: a chapter that only touches MaKlaude advances MaKlaude's tag while genesis stays put. So genesis is re-vendored only in the chapters where it actually changed — where a chapter left genesis untouched, its `genesis/` directory is omitted and you read the snapshot from the most recent chapter that did change it.
 
 | Chapter | genesis | MaKlaude | End state |
 |---------|---------|----------|-----------|
 | ch-03   | `v0.1`  | `v0.1`   | Bootstrapped: scaffold published, onboarding done |
 | ch-04   | `v0.2`  | `v0.2`   | Milestone 1 complete: read-only foundation, shipped and verified |
-| ch-05+  | later tags | later tags | added as each chapter lands |
+| ch-05   | unchanged (`v0.2`) | `v0.3` | Human-in-the-loop steering: comms channels and escalation |
+| ch-06   | `v0.3`  | `v0.4`   | The evolver: self-improvement, seed backport, the two-tier gap |
 
 ## Refreshing a chapter's snapshot
 
-Run from the repo root. Set the chapter and tag, then drop in each repo's tree at that tag with no `.git`.
+Run from the repo root. Set the chapter and each repo's tag, then drop in each tree at that tag with no `.git`. Skip the repo that didn't change in the chapter.
 
 ```bash
-CH=ch-04
-TAG=v0.2
+CH=ch-06
+GENESIS_TAG=v0.3
+MAKLAUDE_TAG=v0.4
 
-for repo in genesis MaKlaude; do
-  rm -rf "$CH/$repo"
-  git clone --depth 1 --branch "$TAG" "https://github.com/Sayfan-AI/$repo.git" "$CH/$repo"
-  rm -rf "$CH/$repo/.git"
-done
+rm -rf "$CH/genesis"
+git clone --depth 1 --branch "$GENESIS_TAG" https://github.com/Sayfan-AI/genesis.git "$CH/genesis"
+rm -rf "$CH/genesis/.git"
+
+rm -rf "$CH/MaKlaude"
+git clone --depth 1 --branch "$MAKLAUDE_TAG" https://github.com/Sayfan-AI/MaKlaude.git "$CH/MaKlaude"
+rm -rf "$CH/MaKlaude/.git"
 ```
 
 `MaKlaude` is a private repository, so you need access to it. `genesis` lives at `Sayfan-AI/genesis`.
@@ -37,13 +41,15 @@ done
 If you already have local clones of both repos, `git archive` is faster and skips the network:
 
 ```bash
-CH=ch-04
-TAG=v0.2
+CH=ch-06
+GENESIS_TAG=v0.3
+MAKLAUDE_TAG=v0.4
 
-for repo in genesis MaKlaude; do
-  rm -rf "$CH/$repo" && mkdir -p "$CH/$repo"
-  git -C ~/git/"$repo" archive "$TAG" | tar -x -C "$CH/$repo"
-done
+rm -rf "$CH/genesis" && mkdir -p "$CH/genesis"
+git -C ~/git/genesis archive "$GENESIS_TAG" | tar -x -C "$CH/genesis"
+
+rm -rf "$CH/MaKlaude" && mkdir -p "$CH/MaKlaude"
+git -C ~/git/MaKlaude archive "$MAKLAUDE_TAG" | tar -x -C "$CH/MaKlaude"
 ```
 
 ## Notes
