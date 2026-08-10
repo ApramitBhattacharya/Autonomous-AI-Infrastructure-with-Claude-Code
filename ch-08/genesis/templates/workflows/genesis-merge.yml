@@ -1,0 +1,66 @@
+name: Genesis Auto-Merge
+
+on:
+  workflow_run:
+    workflows: ["CI"]
+    types: [completed]
+
+permissions:
+  contents: write
+  issues: write
+  pull-requests: write
+
+jobs:
+  merge:
+    runs-on: ubuntu-latest
+    # Only run when CI succeeds on a PR
+    if: github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'pull_request'
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/create-github-app-token@v3
+        id: app-token
+        with:
+          app-id: ${{ secrets.GENESIS_APP_ID }}
+          private-key: ${{ secrets.GENESIS_APP_PRIVATE_KEY }}
+          permission-contents: write
+          permission-issues: write
+          permission-pull-requests: write
+          permission-workflows: write
+
+      - uses: anthropics/claude-code-action@v1
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          github_token: ${{ steps.app-token.outputs.token }}
+          allowed_bots: "genesis-dev-bot[bot],dependabot[bot]"
+          # Reaches the activity-logging hooks in .claude/settings.json. The
+          # `settings` input MERGES with the repo's settings, so the hooks survive.
+          # Unset secrets render as empty strings and log.sh skips the push. There is
+          # no stderr consolation prize: Claude Code captures hook stderr into its
+          # own transcript, so unconfigured Loki means no activity trail at all.
+          settings: |
+            {
+              "env": {
+                "GENESIS_LOKI_URL": "${{ secrets.GENESIS_LOKI_URL }}",
+                "GENESIS_LOKI_USER": "${{ secrets.GENESIS_LOKI_USER }}",
+                "GENESIS_LOKI_TOKEN": "${{ secrets.GENESIS_LOKI_TOKEN }}"
+              }
+            }
+          prompt: |
+            CI just passed on a PR. Check if there are any open PRs created by genesis-dev-bot
+            where all CI checks have passed. If so, merge them.
+
+            Rules:
+            - Only merge PRs created by genesis-dev-bot[bot]
+            - All CI checks must be passing
+            - Use squash merge
+            - After merging, close the corresponding task issue if one exists
+            - After all merges are done, trigger the orchestrator so it can assess state and continue work:
+              gh workflow run genesis-orchestrator.yml
+          # Narrow class — small ON PURPOSE, do not raise to the orchestrator floor.
+          # This is a fixed procedure (find passing bot PRs, squash-merge, close the
+          # task issue, re-trigger). If it needs more than ~10 turns it is wandering,
+          # and failing fast is the signal we want. Enforced as a ceiling by
+          # tests/e2e/test_workflows.py — the fix for a starved merge run is a
+          # tighter procedure, not a bigger budget.
+          claude_args: "--max-turns 10 --allowedTools Bash,Read,Glob,Grep"

@@ -1,0 +1,97 @@
+name: Genesis Evolver
+
+on:
+  issues:
+    types: [opened, labeled]
+  issue_comment:
+    types: [created]
+  schedule:
+    # Weekly sweep for unprocessed issues
+    - cron: '0 6 * * 1'
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+  issues: write
+  pull-requests: write
+  # No id-token: write. With an OIDC token available and no `github_token` input,
+  # claude-code-action takes the OIDC -> app-token exchange path, which requires
+  # the separate Claude Code GitHub App (github.com/apps/claude) to be installed
+  # here. It isn't, so every run 401'd three times and died before Claude
+  # started. We authenticate as the Genesis App below instead, like every
+  # workflow genesis seeds into a dev system.
+
+# One evolver at a time. `gh issue create --label` fires BOTH an `opened` and a
+# `labeled` event, which started two 40-turn agents on the same issue (genesis
+# issue #37) racing to open competing PRs. The seeded dev-system templates have
+# had a concurrency group for a while; genesis's own workflow never got one.
+concurrency:
+  group: genesis-evolver-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  evolve:
+    runs-on: ubuntu-latest
+    # Only run for needs:evolver issues, scheduled sweeps, or manual triggers
+    if: >-
+      github.event_name == 'schedule' ||
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'issues' && contains(github.event.issue.labels.*.name, 'needs:evolver')) ||
+      (github.event_name == 'issue_comment' && contains(github.event.issue.labels.*.name, 'needs:evolver'))
+    steps:
+      # v7's one behavior change is blocking fork-PR checkouts under
+      # pull_request_target / workflow_run, neither of which triggers this
+      # workflow. Note that genesis-merge.yml DOES use workflow_run, so bumping
+      # the templates to v7 needs that checked separately.
+      - uses: actions/checkout@v7
+
+      - uses: actions/create-github-app-token@v3
+        id: app-token
+        with:
+          app-id: ${{ secrets.GENESIS_APP_ID }}
+          private-key: ${{ secrets.GENESIS_APP_PRIVATE_KEY }}
+          permission-contents: write
+          permission-issues: write
+          permission-pull-requests: write
+          permission-workflows: write
+          # The evolver's primary signal is failed runs, so it needs to read them.
+          permission-actions: read
+
+      - uses: anthropics/claude-code-action@v1
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          github_token: ${{ steps.app-token.outputs.token }}
+          prompt: |
+            Run the evolver agent defined in .claude/agents/evolver.md.
+
+            Trigger: ${{ github.event_name }} / ${{ github.event.action }}
+            ${{ github.event.issue.number && format('Issue: #{0}', github.event.issue.number) || '' }}
+
+            Scope for this run — ONE issue, not the queue:
+
+            1. Pick exactly one `needs:evolver` issue. If this run was triggered
+               by an issue event, that is the one. Otherwise take the smallest
+               open one you can finish end to end.
+            2. Before doing any work, comment on that issue with a task
+               checklist: the steps you intend to take, unchecked. Keep it short.
+            3. Work the checklist, updating that comment as items complete.
+            4. If an issue is too large to finish in this run, do NOT start it.
+               Split it into sub-issues labeled `needs:evolver`, comment saying
+               so, and stop. A large issue attempted in one run produces nothing.
+            5. Finish by commenting the outcome and opening a PR. Genesis has no
+               auto-merge, so say in the PR that a human must merge it.
+
+            Why the checklist is mandatory: this workflow has died at
+            `error_max_turns` twice, and the run that left no comment left no
+            diagnosis and no resume point — $1.48 spent for zero durable output.
+            An updated checklist means the next run continues instead of
+            restarting.
+          # 40 turns, and `Write` is in the toolset on purpose. At 15 turns this
+          # workflow was the tightest-budgeted agent in the whole system while
+          # doing the broadest work (evaluate a needs:evolver issue, change
+          # templates, add tests, open a PR) — the exact shape that died at
+          # `error_max_turns` twice on MaKlaude (its #38 and #81) and the subject
+          # of #35. Without `Write` it can only edit existing files, so any issue
+          # asking for a new template or test was impossible to satisfy (same
+          # class as the already-fixed #9).
+          claude_args: "--max-turns 40 --allowedTools Read,Write,Edit,Bash,Glob,Grep,Agent"
