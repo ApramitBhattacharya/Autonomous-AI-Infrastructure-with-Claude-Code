@@ -1,1 +1,3 @@
-Chapter 7 changed neither repository. It audits the security posture that shipped in earlier chapters rather than adding code, so there is no snapshot here: read `../ch-06/genesis` (`v0.3`) and `../ch-06/MaKlaude` (`v0.4`).
+Chapter 7 changed neither repository, so both snapshots here are byte-identical to `../ch-06`: genesis `v0.3` and MaKlaude `v0.4`.
+
+The chapter audits the security posture the earlier chapters shipped, containment, credential scope, gates and audit, rather than adding code to it. The copies are kept anyway so this directory stands on its own.

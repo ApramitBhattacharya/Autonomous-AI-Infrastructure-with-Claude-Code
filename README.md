@@ -9,7 +9,9 @@ The snapshots are vendored as **plain files (no `.git`)**, pinned to the exact v
 
 ## Version per chapter
 
-Each repo carries its own tag, and a chapter pins whichever tag each repo ends on. The two started in lockstep but now diverge: a chapter that only touches MaKlaude advances MaKlaude's tag while genesis stays put. A repo is re-vendored only in the chapters where it actually changed, so where a chapter left one untouched its directory is omitted and you read the snapshot from the most recent chapter that did change it. A chapter can leave both untouched, which is what ch-07 does.
+Each repo carries its own tag, and a chapter pins whichever tag each repo ends on. The two started in lockstep but now diverge: a chapter that only touches MaKlaude advances MaKlaude's tag while genesis stays put.
+
+Every chapter directory is self-contained and holds both repositories, so you never have to look in a different chapter to find the code. Where the table says *unchanged*, that chapter's snapshot is byte-identical to the previous one, because the chapter didn't move that repo. ch-07 is the clearest case: it audits the security posture the earlier chapters shipped rather than adding to it, so both of its trees match ch-06.
 
 | Chapter | genesis | MaKlaude | End state |
 |---------|---------|----------|-----------|
@@ -22,12 +24,14 @@ Each repo carries its own tag, and a chapter pins whichever tag each repo ends o
 
 ## Refreshing a chapter's snapshot
 
-Use the script. Pass the chapter and a tag for each repo the chapter changed, and omit the flag for a repo it left alone:
+Use the script. Pass the chapter and a tag for each repo. Since every chapter carries both, an unchanged repo takes the same tag as the previous chapter:
 
 ```bash
 scripts/refresh-chapter.sh ch-08 --genesis v0.4 --maklaude v0.5
-scripts/refresh-chapter.sh ch-05 --maklaude v0.3          # genesis unchanged
+scripts/refresh-chapter.sh ch-07 --genesis v0.3 --maklaude v0.4   # unchanged from ch-06
 ```
+
+Passing only one flag refreshes only that repo and leaves the other directory alone, which is handy when re-vendoring a single tree.
 
 It exports with `git archive`, so the snapshot carries tracked files only: no `.git`, no ignored credentials, no local scratch. It reads local clones at `~/git/genesis` and `~/git/MaKlaude`, overridable with `GENESIS_SRC` and `MAKLAUDE_SRC`, and it refuses to vendor a tag that hasn't been pushed, since a local-only tag would leave the snapshot unreproducible for anyone reading the book.
 
