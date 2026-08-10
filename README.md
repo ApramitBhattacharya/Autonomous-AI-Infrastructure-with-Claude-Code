@@ -17,6 +17,7 @@ Each repo carries its own tag, and a chapter pins whichever tag each repo ends o
 | ch-04   | `v0.2`  | `v0.2`   | Milestone 1 complete: read-only foundation, shipped and verified |
 | ch-05   | unchanged (`v0.2`) | `v0.3` | Human-in-the-loop steering: comms channels and escalation |
 | ch-06   | `v0.3`  | `v0.4`   | The evolver: self-improvement, seed backport, the two-tier gap |
+| ch-07   | unchanged (`v0.3`) | unchanged (`v0.4`) | Permissions and trust: the chapter audits the posture already shipped rather than adding to it |
 
 ## Refreshing a chapter's snapshot
 

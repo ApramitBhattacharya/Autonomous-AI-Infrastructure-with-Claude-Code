@@ -1,0 +1,1 @@
+Chapter 7 changed neither repository. It audits the security posture that shipped in earlier chapters rather than adding code, so there is no snapshot here: read `../ch-06/genesis` (`v0.3`) and `../ch-06/MaKlaude` (`v0.4`).
