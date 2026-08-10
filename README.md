@@ -9,7 +9,7 @@ The snapshots are vendored as **plain files (no `.git`)**, pinned to the exact v
 
 ## Version per chapter
 
-Each repo carries its own tag, and a chapter pins whichever tag each repo ends on. The two started in lockstep but now diverge: a chapter that only touches MaKlaude advances MaKlaude's tag while genesis stays put. So genesis is re-vendored only in the chapters where it actually changed — where a chapter left genesis untouched, its `genesis/` directory is omitted and you read the snapshot from the most recent chapter that did change it.
+Each repo carries its own tag, and a chapter pins whichever tag each repo ends on. The two started in lockstep but now diverge: a chapter that only touches MaKlaude advances MaKlaude's tag while genesis stays put. A repo is re-vendored only in the chapters where it actually changed, so where a chapter left one untouched its directory is omitted and you read the snapshot from the most recent chapter that did change it. A chapter can leave both untouched, which is what ch-07 does.
 
 | Chapter | genesis | MaKlaude | End state |
 |---------|---------|----------|-----------|
@@ -20,36 +20,20 @@ Each repo carries its own tag, and a chapter pins whichever tag each repo ends o
 
 ## Refreshing a chapter's snapshot
 
-Run from the repo root. Set the chapter and each repo's tag, then drop in each tree at that tag with no `.git`. Skip the repo that didn't change in the chapter.
+Use the script. Pass the chapter and a tag for each repo the chapter changed, and omit the flag for a repo it left alone:
 
 ```bash
-CH=ch-06
-GENESIS_TAG=v0.3
-MAKLAUDE_TAG=v0.4
-
-rm -rf "$CH/genesis"
-git clone --depth 1 --branch "$GENESIS_TAG" https://github.com/Sayfan-AI/genesis.git "$CH/genesis"
-rm -rf "$CH/genesis/.git"
-
-rm -rf "$CH/MaKlaude"
-git clone --depth 1 --branch "$MAKLAUDE_TAG" https://github.com/Sayfan-AI/MaKlaude.git "$CH/MaKlaude"
-rm -rf "$CH/MaKlaude/.git"
+scripts/refresh-chapter.sh ch-08 --genesis v0.4 --maklaude v0.5
+scripts/refresh-chapter.sh ch-05 --maklaude v0.3          # genesis unchanged
 ```
 
-`MaKlaude` is a private repository, so you need access to it. `genesis` lives at `Sayfan-AI/genesis`.
+It exports with `git archive`, so the snapshot carries tracked files only: no `.git`, no ignored credentials, no local scratch. It reads local clones at `~/git/genesis` and `~/git/MaKlaude`, overridable with `GENESIS_SRC` and `MAKLAUDE_SRC`, and it refuses to vendor a tag that hasn't been pushed, since a local-only tag would leave the snapshot unreproducible for anyone reading the book.
 
-If you already have local clones of both repos, `git archive` is faster and skips the network:
+Both source repos are public: `Sayfan-AI/genesis` and `Sayfan-AI/MaKlaude`. Without local clones, clone the tag first and point the script at it:
 
 ```bash
-CH=ch-06
-GENESIS_TAG=v0.3
-MAKLAUDE_TAG=v0.4
-
-rm -rf "$CH/genesis" && mkdir -p "$CH/genesis"
-git -C ~/git/genesis archive "$GENESIS_TAG" | tar -x -C "$CH/genesis"
-
-rm -rf "$CH/MaKlaude" && mkdir -p "$CH/MaKlaude"
-git -C ~/git/MaKlaude archive "$MAKLAUDE_TAG" | tar -x -C "$CH/MaKlaude"
+git clone --branch v0.5 https://github.com/Sayfan-AI/MaKlaude.git /tmp/MaKlaude
+MAKLAUDE_SRC=/tmp/MaKlaude scripts/refresh-chapter.sh ch-08 --maklaude v0.5
 ```
 
 ## Notes
