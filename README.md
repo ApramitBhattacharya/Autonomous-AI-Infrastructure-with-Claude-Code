@@ -1,9 +1,9 @@
-# Code Companion — *Autonomous AI Infrastructure with Claude Code*
+# Code Companion - *Autonomous AI Infrastructure with Claude Code*
 
 Each `ch-NN/` directory holds a frozen snapshot of the two repositories the book builds:
 
-- **genesis** — the bootstrapper that scaffolds autonomous dev systems.
-- **MaKlaude** — the dev system genesis bootstraps in the running example (autonomous Kubernetes operations).
+- **genesis** - the bootstrapper that scaffolds autonomous dev systems.
+- **MaKlaude** - the dev system genesis bootstraps in the running example (autonomous Kubernetes operations).
 
 The snapshots are vendored as **plain files (no `.git`)**, pinned to the exact version that chapter ends on, so you can read the precise code each chapter describes without checking out tags yourself.
 
