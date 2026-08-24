@@ -1,0 +1,1014 @@
+name: E2E (kind)
+
+# End-to-end gate: spin up a real kind cluster, seed failure scenarios, run the
+# MaKlaude read-only scan as its least-privilege ServiceAccount, and assert
+#   (a) the expected findings are detected,
+#   (b) an escalation is produced, and
+#   (c) ZERO writes reached the cluster.
+#
+# Since Milestone 4 the job also seeds a FIXABLE fault — a Deployment rolled forward
+# onto an unpullable image — and drives the whole gated-remediation flow against it:
+# propose, preview, simulate an explicit human approval, execute exactly that one
+# action, and watch the cluster converge. The zero-writes assertion above is unchanged
+# for the observation identity; the executor identity's single approved write is
+# accounted for request-by-request against the apiserver audit log. See
+# test/e2e/remediation_test.go.
+#
+# This job runs on every pull request (and pushes to main) so it gates merges.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: e2e-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  GO_VERSION: "1.24"
+  # Pinned tool versions for reproducibility.
+  KIND_VERSION: "v0.24.0"
+  # Node image tag is pinned; the digest is intentionally omitted so a stale or
+  # mistyped digest can't break the whole job. kind v0.24.0 ships v1.31.2 as its
+  # default node image, so this pairing is the tested combination.
+  KIND_NODE_IMAGE: "kindest/node:v1.31.2"
+  CLUSTER_NAME: "maklaude-e2e"
+
+jobs:
+  e2e:
+    name: e2e on kind
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: Install Task
+        uses: arduino/setup-task@v2
+        with:
+          version: 3.x
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Prepare audit policy + log dirs
+        run: |
+          set -euo pipefail
+          # Host directories mounted into the kind control-plane for apiserver
+          # audit logging (the observational half of the zero-writes proof).
+          AUDIT_DIR="${RUNNER_TEMP}/maklaude-audit"
+          AUDIT_LOG_DIR="${RUNNER_TEMP}/maklaude-audit-log"
+          mkdir -p "$AUDIT_DIR" "$AUDIT_LOG_DIR"
+          chmod 777 "$AUDIT_LOG_DIR"
+          cp test/e2e/kind/audit-policy.yaml "$AUDIT_DIR/audit-policy.yaml"
+
+          # Substitute the host-path placeholders in the kind config.
+          KIND_CFG="${RUNNER_TEMP}/kind-config.yaml"
+          sed -e "s#HOST_AUDIT_DIR#${AUDIT_DIR}#g" \
+              -e "s#HOST_AUDIT_LOG_DIR#${AUDIT_LOG_DIR}#g" \
+              test/e2e/kind/kind-config.yaml > "$KIND_CFG"
+          echo "Rendered kind config:"
+          cat "$KIND_CFG"
+
+          echo "AUDIT_LOG_DIR=${AUDIT_LOG_DIR}" >> "$GITHUB_ENV"
+          echo "KIND_CFG=${KIND_CFG}" >> "$GITHUB_ENV"
+
+      - name: Create kind cluster
+        uses: helm/kind-action@v1.10.0
+        with:
+          version: ${{ env.KIND_VERSION }}
+          node_image: ${{ env.KIND_NODE_IMAGE }}
+          cluster_name: ${{ env.CLUSTER_NAME }}
+          config: ${{ env.KIND_CFG }}
+          wait: 120s
+
+      - name: Apply read-only RBAC bundle
+        run: |
+          set -euo pipefail
+          kubectl apply -k deploy/rbac
+          # Confirm the SA exists before minting a token.
+          kubectl -n maklaude get serviceaccount maklaude
+
+      - name: Verify RBAC is read-only (auth can-i)
+        run: |
+          set -euo pipefail
+          SA=system:serviceaccount:maklaude:maklaude
+          echo "Grants for $SA:"
+          kubectl auth can-i --list --as="$SA" || true
+
+          fail=0
+          assert_yes() {
+            if [ "$(kubectl auth can-i "$@" 2>/dev/null)" != "yes" ]; then
+              echo "::error::expected ALLOWED but denied: $*"; fail=1
+            fi
+          }
+          assert_no() {
+            if [ "$(kubectl auth can-i "$@" 2>/dev/null)" = "yes" ]; then
+              echo "::error::expected DENIED but allowed: $*"; fail=1
+            fi
+          }
+          assert_yes list pods --as="$SA" -A
+          assert_yes list nodes --as="$SA"
+          assert_yes list events --as="$SA" -A
+          assert_yes list deployments.apps --as="$SA" -A
+          assert_no create pods --as="$SA"
+          assert_no delete pods --as="$SA"
+          assert_no patch deployments.apps --as="$SA"
+          assert_no get secrets --as="$SA" -A
+          [ "$fail" -eq 0 ] || { echo "RBAC read-only assertions failed"; exit 1; }
+          echo "RBAC is read-only as expected."
+
+      # The optional minimal-write bundle (deploy/rbac/write). It is applied here
+      # AFTER the read-only assertions above have already passed, and the checks
+      # below re-run the write-denial assertions on the observation identity, so
+      # this step proves the property that makes the bundle safe to install:
+      # granting the executor its three verbs widens nothing for the account every
+      # read in MaKlaude uses.
+      #
+      # Applying it cannot compromise the zero-writes proof the Go e2e performs
+      # later — that test authenticates with a token minted for the `maklaude`
+      # ServiceAccount, which this bundle never binds.
+      - name: Apply and verify the minimal-write RBAC bundle
+        run: |
+          set -euo pipefail
+          kubectl apply -k deploy/rbac/write
+          kubectl -n maklaude get serviceaccount maklaude-executor
+
+          SA=system:serviceaccount:maklaude:maklaude
+          EXEC=system:serviceaccount:maklaude:maklaude-executor
+          echo "Grants for $EXEC:"
+          kubectl auth can-i --list --as="$EXEC" || true
+
+          fail=0
+          assert_yes() {
+            if [ "$(kubectl auth can-i "$@" 2>/dev/null)" != "yes" ]; then
+              echo "::error::expected ALLOWED but denied: $*"; fail=1
+            fi
+          }
+          assert_no() {
+            if [ "$(kubectl auth can-i "$@" 2>/dev/null)" = "yes" ]; then
+              echo "::error::expected DENIED but allowed: $*"; fail=1
+            fi
+          }
+
+          # The executor's catalog: exactly the three primitives in
+          # internal/kube/executor.go, one assertion each.
+          assert_yes patch deployments.apps --as="$EXEC" -A
+          assert_yes patch nodes --as="$EXEC"
+          assert_yes delete pods --as="$EXEC" -A
+
+          # Reads, via the additive maklaude-readonly binding — an executor
+          # re-reads its target to obtain the resourceVersion it conditions on.
+          assert_yes get deployments.apps --as="$EXEC" -A
+          assert_yes list replicasets.apps --as="$EXEC" -A
+
+          # The dangerous neighbours. deletecollection is the one that matters
+          # most: the executor's WriteScope pins an exact object path and cannot
+          # express a bulk delete, and RBAC must agree rather than merely not be
+          # asked.
+          assert_no deletecollection pods --as="$EXEC" -A
+          assert_no deletecollection deployments.apps --as="$EXEC" -A
+          assert_no delete deployments.apps --as="$EXEC" -A
+          assert_no delete nodes --as="$EXEC"
+          assert_no update deployments.apps --as="$EXEC" -A
+          assert_no patch pods --as="$EXEC" -A
+          assert_no create pods --as="$EXEC" -A
+          assert_no create pods/eviction --as="$EXEC" -A
+          assert_no get secrets --as="$EXEC" -A
+
+          # THE POINT OF THE SEPARATE IDENTITY: installing the write bundle must
+          # leave the observation account exactly as read-only as it was before.
+          assert_no patch deployments.apps --as="$SA" -A
+          assert_no patch nodes --as="$SA"
+          assert_no delete pods --as="$SA" -A
+          assert_no deletecollection pods --as="$SA" -A
+
+          [ "$fail" -eq 0 ] || { echo "minimal-write RBAC assertions failed"; exit 1; }
+          echo "Minimal-write RBAC is scoped as expected, and the observation identity is unchanged."
+
+      # The optional chaos bundle (deploy/rbac/chaos), Milestone 6's third identity.
+      # It is applied here, after both sets of assertions above have passed, and the
+      # checks below re-run the denial assertions on BOTH earlier identities — so
+      # this step proves what makes a third write delta safe to install: granting
+      # MaKlaude the ability to ask Chaos Mesh to break something widens nothing for
+      # the account that reads and nothing for the account that remediates.
+      #
+      # This needs no Chaos Mesh installation, and the assertions are written so that
+      # it genuinely does not: they POST SubjectAccessReviews rather than shelling
+      # out to `kubectl auth can-i`. The two answer the same question, but `can-i`
+      # first maps the resource name through DISCOVERY, and `podchaos` has no CRD on
+      # this cluster — so its behaviour with an absent resource type would be the
+      # load-bearing detail of every assertion below. A SubjectAccessReview takes the
+      # group and resource as literal strings and is evaluated against the RBAC rules
+      # alone, which is the thing being tested. Whether an experiment actually RUNS
+      # is T8's job (issue #197) and needs the real Chaos Mesh.
+      - name: Apply and verify the chaos RBAC bundle
+        run: |
+          set -euo pipefail
+          kubectl apply -k deploy/rbac/chaos
+          kubectl -n maklaude get serviceaccount maklaude-chaos
+
+          SA=system:serviceaccount:maklaude:maklaude
+          EXEC=system:serviceaccount:maklaude:maklaude-executor
+          CHAOS=system:serviceaccount:maklaude:maklaude-chaos
+          echo "Grants for $CHAOS in maklaude-chaos:"
+          kubectl auth can-i --list --as="$CHAOS" -n maklaude-chaos || true
+
+          # can <user> <verb> <group> <resource> [namespace]
+          # An empty namespace asks the cluster-scoped question, which for a
+          # namespaced resource is "may this identity do it in ANY namespace" — the
+          # equivalent of `auth can-i -A`.
+          can() {
+            kubectl create -o jsonpath='{.status.allowed}' -f - <<EOF
+          apiVersion: authorization.k8s.io/v1
+          kind: SubjectAccessReview
+          spec:
+            user: "$1"
+            resourceAttributes:
+              verb: "$2"
+              group: "$3"
+              resource: "$4"
+              namespace: "${5:-}"
+          EOF
+          }
+
+          fail=0
+          assert_allowed() {
+            if [ "$(can "$@")" != "true" ]; then
+              echo "::error::expected ALLOWED but denied: $*"; fail=1
+            fi
+          }
+          assert_denied() {
+            if [ "$(can "$@")" = "true" ]; then
+              echo "::error::expected DENIED but allowed: $*"; fail=1
+            fi
+          }
+
+          # The injector's catalog: exactly the three calls in
+          # internal/chaos/injector.go, in the one namespace experiment objects live.
+          assert_allowed "$CHAOS" get    chaos-mesh.org podchaos maklaude-chaos
+          assert_allowed "$CHAOS" create chaos-mesh.org podchaos maklaude-chaos
+          assert_allowed "$CHAOS" delete chaos-mesh.org podchaos maklaude-chaos
+
+          # THE DONE CRITERION OF T2: the chaos identity cannot touch a workload
+          # directly. MaKlaude asks Chaos Mesh to kill a pod; it must not be able to
+          # kill one itself, in any namespace, with any verb.
+          assert_denied "$CHAOS" delete "" pods
+          assert_denied "$CHAOS" get    "" pods
+          assert_denied "$CHAOS" list   "" pods
+          assert_denied "$CHAOS" patch  apps deployments
+          assert_denied "$CHAOS" patch  "" nodes
+          assert_denied "$CHAOS" get    "" secrets
+
+          # A namespaced Role, so the grant cannot follow the identity elsewhere.
+          assert_denied "$CHAOS" create chaos-mesh.org podchaos default
+          assert_denied "$CHAOS" create chaos-mesh.org podchaos kube-system
+
+          # The neighbours an over-broad chaos role would acquire: bulk deletion of
+          # experiments, editing a live fault, and the kinds outside the closed
+          # one-kind catalog in internal/chaos.
+          assert_denied "$CHAOS" deletecollection chaos-mesh.org podchaos     maklaude-chaos
+          assert_denied "$CHAOS" update           chaos-mesh.org podchaos     maklaude-chaos
+          assert_denied "$CHAOS" patch            chaos-mesh.org podchaos     maklaude-chaos
+          assert_denied "$CHAOS" create           chaos-mesh.org networkchaos maklaude-chaos
+          assert_denied "$CHAOS" create           chaos-mesh.org schedules    maklaude-chaos
+          assert_denied "$CHAOS" create           chaos-mesh.org workflows    maklaude-chaos
+
+          # THE POINT OF THE THIRD IDENTITY: neither earlier account gained chaos.
+          assert_denied "$SA"   create chaos-mesh.org podchaos maklaude-chaos
+          assert_denied "$EXEC" create chaos-mesh.org podchaos maklaude-chaos
+          # And both are exactly as bounded as they were before this bundle existed.
+          assert_allowed "$SA"   list  "" pods
+          assert_denied  "$SA"   patch apps deployments
+          assert_denied  "$SA"   delete "" pods
+          assert_allowed "$EXEC" patch apps deployments
+          assert_denied  "$EXEC" deletecollection "" pods
+          assert_denied  "$EXEC" delete apps deployments
+
+          [ "$fail" -eq 0 ] || { echo "chaos RBAC assertions failed"; exit 1; }
+          echo "Chaos RBAC is scoped as expected; the observation and executor identities are unchanged."
+
+      - name: Seed failure scenarios
+        run: |
+          set -euo pipefail
+          kubectl apply -f test/e2e/manifests/crashloop-pod.yaml
+          kubectl apply -f test/e2e/manifests/pending-pod.yaml
+          kubectl apply -f test/e2e/manifests/badimage-deploy.yaml
+          # The FIXABLE fault is seeded in two steps: this applies revision 1 (a
+          # working image), and a later step rolls it forward onto one that cannot be
+          # pulled. Both halves are required — the rollback MaKlaude proposes is only
+          # possible because a previous revision demonstrably ran. See the manifest.
+          #
+          # There are TWO of them because two tests each drive an approved rollback to
+          # completion and a remediated Deployment is healthy afterwards, so neither can
+          # reuse the other's fault: `wedged` is remediated in-process by
+          # TestE2E_GatedRemediation, `stuck` by the shipped binary in
+          # TestE2E_BinaryTwoPassGatedRemediation. See stuck-deploy.yaml.
+          kubectl apply -f test/e2e/manifests/wedged-deploy.yaml
+          kubectl apply -f test/e2e/manifests/stuck-deploy.yaml
+          # Milestone 5's unattended scenarios: three more fixable faults, one per
+          # namespace, because a namespace is the only bound an autonomy rule has. See
+          # the manifest header for the layout and why `neverready` cannot converge.
+          kubectl apply -f test/e2e/manifests/autonomy-scenarios.yaml
+
+      - name: Wait for crashloop pod to enter CrashLoopBackOff
+        run: |
+          set -euo pipefail
+          ns=maklaude-e2e
+          deadline=$(( $(date +%s) + 180 ))
+          while :; do
+            reason=$(kubectl -n "$ns" get pod crashloop \
+              -o jsonpath='{.status.containerStatuses[0].state.waiting.reason}' 2>/dev/null || true)
+            restarts=$(kubectl -n "$ns" get pod crashloop \
+              -o jsonpath='{.status.containerStatuses[0].restartCount}' 2>/dev/null || echo 0)
+            echo "crashloop: reason='${reason}' restarts='${restarts}'"
+            if [ "$reason" = "CrashLoopBackOff" ]; then
+              echo "crashloop pod reached CrashLoopBackOff."
+              break
+            fi
+            if [ "$(date +%s)" -ge "$deadline" ]; then
+              echo "::error::crashloop pod did not reach CrashLoopBackOff in time"
+              kubectl -n "$ns" describe pod crashloop || true
+              exit 1
+            fi
+            sleep 5
+          done
+
+      - name: Wait for pending pod to be Unschedulable
+        run: |
+          set -euo pipefail
+          ns=maklaude-e2e
+          deadline=$(( $(date +%s) + 120 ))
+          while :; do
+            phase=$(kubectl -n "$ns" get pod pending -o jsonpath='{.status.phase}' 2>/dev/null || true)
+            echo "pending pod phase='${phase}'"
+            if [ "$phase" = "Pending" ]; then
+              # Confirm it is actually unschedulable (a FailedScheduling condition),
+              # not merely briefly pending during normal startup.
+              cond=$(kubectl -n "$ns" get pod pending \
+                -o jsonpath='{.status.conditions[?(@.type=="PodScheduled")].reason}' 2>/dev/null || true)
+              echo "pending pod PodScheduled reason='${cond}'"
+              if [ "$cond" = "Unschedulable" ]; then
+                echo "pending pod is Unschedulable."
+                break
+              fi
+            fi
+            if [ "$(date +%s)" -ge "$deadline" ]; then
+              echo "::error::pending pod did not become Unschedulable in time"
+              kubectl -n "$ns" describe pod pending || true
+              exit 1
+            fi
+            sleep 5
+          done
+
+      - name: Wait for bad-image deployment to enter ImagePullBackOff
+        run: |
+          set -euo pipefail
+          ns=maklaude-e2e
+          deadline=$(( $(date +%s) + 180 ))
+          while :; do
+            # Match the deployment's pod by its scenario label; the pull failure
+            # surfaces as the container's waiting reason.
+            reason=$(kubectl -n "$ns" get pod -l scenario=badimage \
+              -o jsonpath='{.items[0].status.containerStatuses[0].state.waiting.reason}' 2>/dev/null || true)
+            avail=$(kubectl -n "$ns" get deployment badimage \
+              -o jsonpath='{.status.availableReplicas}' 2>/dev/null || echo 0)
+            echo "badimage: reason='${reason}' availableReplicas='${avail:-0}'"
+            # ImagePullBackOff (the settled state) or ErrImagePull (its transient
+            # precursor) both prove the pull failed; the deployment must also have
+            # 0 available replicas, i.e. the cascade has fully materialized.
+            if { [ "$reason" = "ImagePullBackOff" ] || [ "$reason" = "ErrImagePull" ]; } \
+               && [ -z "${avail:-}" -o "${avail:-0}" = "0" ]; then
+              echo "badimage deployment reached an image-pull failure with 0 available replicas."
+              break
+            fi
+            if [ "$(date +%s)" -ge "$deadline" ]; then
+              echo "::error::badimage deployment did not enter ImagePullBackOff in time"
+              kubectl -n "$ns" describe deployment badimage || true
+              kubectl -n "$ns" describe pod -l scenario=badimage || true
+              exit 1
+            fi
+            sleep 5
+          done
+
+      # --- The fixable faults, in two steps each. ---
+      #
+      # Revision 1 must be observed HEALTHY before the bad rollout lands. That is not
+      # tidiness: the approval artifact tells a human "revision 1 was running before
+      # this one, so it is known-good", and the whole justification for the rollback
+      # MaKlaude proposes rests on it having been true.
+      #
+      # The scenarios go through the same three phases, so they share one loop rather
+      # than duplicated step bodies. Each test needs a fault of its own because the
+      # first thing a successful remediation does is remove it: `wedged` is remediated
+      # in-process by TestE2E_GatedRemediation, `stuck` by the shipped binary in
+      # TestE2E_BinaryTwoPassGatedRemediation, and `earned` unattended by
+      # TestE2E_UnattendedAutonomy. `offlimits` is remediated by nobody — that is what
+      # it proves — and `neverready`'s remediation is designed to fail.
+      #
+      # The pairs are namespace/deployment because Milestone 5's scenarios each live in
+      # their own namespace; see test/e2e/manifests/autonomy-scenarios.yaml.
+      - name: Wait for each fixable fault's first revision to be healthy
+        run: |
+          set -euo pipefail
+          for pair in maklaude-e2e/wedged maklaude-e2e/stuck maklaude-e2e-auto/earned maklaude-e2e-offlimits/offlimits; do
+            ns="${pair%%/*}"; d="${pair##*/}"
+            kubectl rollout status "deployment/${d}" --timeout=180s -n "$ns"
+            kubectl get deployment "$d" -o wide -n "$ns"
+          done
+
+      # `neverready` is excluded from the loop above on purpose: its revision 1 carries
+      # a readiness probe that always fails, so `kubectl rollout status` would block
+      # until it timed out. What has to be true before the bad rollout lands is only
+      # that revision 1 EXISTS as a running pod — there has to be something for the
+      # rollback to restore — so that is what is waited for, and the never-Ready part
+      # is asserted rather than merely tolerated: if this pod ever went Ready, the
+      # circuit-breaker phase would silently become a test of a converging action.
+      - name: Wait for the unfixable fault's first revision to be running and not ready
+        run: |
+          set -euo pipefail
+          ns=maklaude-e2e-fail
+          deadline=$(( $(date +%s) + 180 ))
+          while :; do
+            phase=$(kubectl get pod -l scenario=neverready \
+              -o jsonpath='{.items[0].status.phase}' -n "$ns" 2>/dev/null || true)
+            ready=$(kubectl get pod -l scenario=neverready \
+              -o jsonpath='{.items[0].status.containerStatuses[0].ready}' -n "$ns" 2>/dev/null || true)
+            echo "neverready: phase='${phase}' ready='${ready}'"
+            if [ "$phase" = "Running" ] && [ "$ready" = "false" ]; then
+              echo "neverready is running and unready, as designed."
+              break
+            fi
+            if [ "$ready" = "true" ]; then
+              echo "::error::the neverready pod became Ready; its readiness probe is supposed to fail forever"
+              kubectl describe pod -l scenario=neverready -n "$ns" || true
+              exit 1
+            fi
+            if [ "$(date +%s)" -ge "$deadline" ]; then
+              echo "::error::the neverready pod did not reach Running/not-Ready in time"
+              kubectl describe pod -l scenario=neverready -n "$ns" || true
+              exit 1
+            fi
+            sleep 5
+          done
+
+      # The bad rollout itself. The tag does not exist on Docker Hub, so the pull fails
+      # fast with "manifest unknown" rather than hanging on DNS — the same determinism
+      # argument badimage-deploy.yaml makes. `set image` (rather than a second manifest)
+      # is used because it produces a genuine second revision through the same API path
+      # an operator's own bad rollout would.
+      #
+      # They all get the SAME unpullable tag on purpose: the Go assertion that the
+      # rollback restored a good image keys on the substring
+      # "maklaude-e2e-wedged-rollout" (test/e2e/remediation_test.go, wedgeImageMarker),
+      # so one marker covers every scenario.
+      - name: Wedge each fixable fault with a bad rollout
+        run: |
+          set -euo pipefail
+          for pair in maklaude-e2e/wedged maklaude-e2e/stuck maklaude-e2e-auto/earned \
+                      maklaude-e2e-offlimits/offlimits maklaude-e2e-fail/neverready; do
+            ns="${pair%%/*}"; d="${pair##*/}"
+            kubectl set image "deployment/${d}" \
+              app=busybox:maklaude-e2e-wedged-rollout-v0 -n "$ns"
+          done
+
+      - name: Wait for each fixable fault to be stuck on the bad revision
+        run: |
+          set -euo pipefail
+          for pair in maklaude-e2e/wedged maklaude-e2e/stuck maklaude-e2e-auto/earned \
+                      maklaude-e2e-offlimits/offlimits maklaude-e2e-fail/neverready; do
+            ns="${pair%%/*}"; d="${pair##*/}"
+            deadline=$(( $(date +%s) + 180 ))
+            while :; do
+              reason=$(kubectl get pod -l "scenario=${d}" \
+                -o jsonpath='{.items[0].status.containerStatuses[0].state.waiting.reason}' \
+                -n "$ns" 2>/dev/null || true)
+              avail=$(kubectl get deployment "$d" \
+                -o jsonpath='{.status.availableReplicas}' -n "$ns" 2>/dev/null || echo 0)
+              # The rollback rule refuses unless a PREVIOUS revision still exists, so the
+              # count of surviving revisions is part of what "stuck on a bad revision"
+              # has to mean here. The kubectl call is separated from the counting
+              # pipeline so a transient API error yields an empty list rather than
+              # tripping `pipefail` and aborting the whole wait.
+              raw_revisions=$(kubectl get rs -l "scenario=${d}" \
+                -o jsonpath='{range .items[*]}{.metadata.annotations.deployment\.kubernetes\.io/revision}{"\n"}{end}' \
+                -n "$ns" 2>/dev/null || true)
+              revisions=$(printf '%s\n' "$raw_revisions" | sed '/^$/d' | sort -u | wc -l | tr -d ' ')
+              echo "${d}: reason='${reason}' availableReplicas='${avail:-0}' revisions='${revisions}'"
+              if { [ "$reason" = "ImagePullBackOff" ] || [ "$reason" = "ErrImagePull" ]; } \
+                 && { [ -z "${avail:-}" ] || [ "${avail:-0}" = "0" ]; } \
+                 && [ "${revisions:-0}" -ge 2 ]; then
+                echo "${d} deployment is stuck on the bad revision with a previous revision to roll back to."
+                break
+              fi
+              if [ "$(date +%s)" -ge "$deadline" ]; then
+                echo "::error::${d} deployment did not reach the stuck-on-bad-revision state in time"
+                kubectl describe deployment "$d" -n "$ns" || true
+                kubectl get rs -l "scenario=${d}" -o wide -n "$ns" || true
+                kubectl describe pod -l "scenario=${d}" -n "$ns" || true
+                exit 1
+              fi
+              sleep 5
+            done
+          done
+
+      - name: Mint read-only ServiceAccount kubeconfig
+        run: |
+          set -euo pipefail
+          KCFG="${RUNNER_TEMP}/maklaude-sa.kubeconfig"
+
+          SERVER=$(kubectl config view --minify -o jsonpath='{.clusters[0].cluster.server}')
+          kubectl config view --minify --raw \
+            -o jsonpath='{.clusters[0].cluster.certificate-authority-data}' | base64 -d > "${RUNNER_TEMP}/ca.crt"
+          TOKEN=$(kubectl -n maklaude create token maklaude --duration=1h)
+
+          kubectl --kubeconfig "$KCFG" config set-cluster "${CLUSTER_NAME}" \
+            --server="$SERVER" --certificate-authority="${RUNNER_TEMP}/ca.crt" --embed-certs=true
+          kubectl --kubeconfig "$KCFG" config set-credentials maklaude --token="$TOKEN"
+          kubectl --kubeconfig "$KCFG" config set-context "${CLUSTER_NAME}" \
+            --cluster="${CLUSTER_NAME}" --user=maklaude
+          kubectl --kubeconfig "$KCFG" config use-context "${CLUSTER_NAME}"
+          chmod 600 "$KCFG"
+
+          echo "MAKLAUDE_E2E_KUBECONFIG=${KCFG}" >> "$GITHUB_ENV"
+          echo "MAKLAUDE_E2E_CONTEXT=${CLUSTER_NAME}" >> "$GITHUB_ENV"
+
+      # A SECOND kubeconfig, for the executor identity only. It is deliberately a
+      # separate file with a separate credential rather than another user entry in
+      # the read-only one: the write e2e must be incapable of reaching for the
+      # observation account's token, and vice versa, so a mix-up fails as "no such
+      # credential" instead of silently testing the wrong identity.
+      #
+      # The token is minted for maklaude-executor, which exists only because the
+      # optional write bundle was applied above. Reads in the write e2e go through
+      # this identity too (the additive maklaude-readonly binding covers them) —
+      # an executor re-reads its target for the resourceVersion it conditions on.
+      - name: Mint executor ServiceAccount kubeconfig
+        run: |
+          set -euo pipefail
+          KCFG="${RUNNER_TEMP}/maklaude-executor.kubeconfig"
+
+          SERVER=$(kubectl config view --minify -o jsonpath='{.clusters[0].cluster.server}')
+          TOKEN=$(kubectl -n maklaude create token maklaude-executor --duration=1h)
+
+          # ca.crt was written by the read-only mint step above, from the same
+          # cluster; both kubeconfigs point at one API server.
+          kubectl --kubeconfig "$KCFG" config set-cluster "${CLUSTER_NAME}" \
+            --server="$SERVER" --certificate-authority="${RUNNER_TEMP}/ca.crt" --embed-certs=true
+          kubectl --kubeconfig "$KCFG" config set-credentials maklaude-executor --token="$TOKEN"
+          kubectl --kubeconfig "$KCFG" config set-context "${CLUSTER_NAME}" \
+            --cluster="${CLUSTER_NAME}" --user=maklaude-executor
+          kubectl --kubeconfig "$KCFG" config use-context "${CLUSTER_NAME}"
+          chmod 600 "$KCFG"
+
+          echo "MAKLAUDE_E2E_EXECUTOR_KUBECONFIG=${KCFG}" >> "$GITHUB_ENV"
+
+      - name: Locate audit log
+        run: |
+          set -euo pipefail
+          LOG="${AUDIT_LOG_DIR}/audit.log"
+          if [ -f "$LOG" ]; then
+            echo "Audit log present: $LOG ($(wc -l < "$LOG") lines)"
+            # The apiserver writes the log as root inside the kind node; make it
+            # readable so the non-root runner can corroborate. (The test degrades
+            # gracefully if this ever fails, so don't abort the step.)
+            sudo chmod a+r "$LOG" || true
+            echo "MAKLAUDE_E2E_AUDIT_LOG=${LOG}" >> "$GITHUB_ENV"
+          else
+            echo "::warning::audit log not found at ${LOG}; the e2e will rely on state-invariance + refused-write proofs only"
+          fi
+
+      - name: Run e2e (detect + escalate + zero-writes + dry-run + gated remediation)
+        env:
+          # MAKLAUDE_GITHUB_* intentionally unset -> in-memory dry-run escalation.
+          MAKLAUDE_E2E_KUBECONFIG: ${{ env.MAKLAUDE_E2E_KUBECONFIG }}
+          MAKLAUDE_E2E_EXECUTOR_KUBECONFIG: ${{ env.MAKLAUDE_E2E_EXECUTOR_KUBECONFIG }}
+          MAKLAUDE_E2E_CONTEXT: ${{ env.MAKLAUDE_E2E_CONTEXT }}
+          MAKLAUDE_E2E_AUDIT_LOG: ${{ env.MAKLAUDE_E2E_AUDIT_LOG }}
+        run: task e2e
+
+      - name: Diagnostics on failure
+        if: failure()
+        run: |
+          echo "=== pods ==="
+          kubectl get pods -A || true
+          echo "=== e2e namespace ==="
+          kubectl -n maklaude-e2e describe pods || true
+          echo "=== deployments + revisions (the remediation targets) ==="
+          for pair in maklaude-e2e/wedged maklaude-e2e/stuck maklaude-e2e-auto/earned \
+                      maklaude-e2e-offlimits/offlimits maklaude-e2e-fail/neverready; do
+            ns="${pair%%/*}"; d="${pair##*/}"
+            kubectl get deployments,replicasets,pods -o wide -n "$ns" || true
+            kubectl rollout history "deployment/${d}" -n "$ns" || true
+            kubectl describe deployment "$d" -n "$ns" || true
+          done
+          echo "=== audit tail (MaKlaude SA) ==="
+          if [ -n "${AUDIT_LOG_DIR:-}" ] && [ -f "${AUDIT_LOG_DIR}/audit.log" ]; then
+            grep "system:serviceaccount:maklaude:maklaude" "${AUDIT_LOG_DIR}/audit.log" | tail -50 || true
+          fi
+
+  # ---------------------------------------------------------------------------
+  # Milestone 6, T3: the chaos experiment lifecycle against a real Chaos Mesh.
+  #
+  # A SEPARATE job with its own kind cluster, not extra steps on the one above,
+  # for a reason that is about signal rather than tidiness. The job above asserts
+  # that MaKlaude detects faults and converges the workloads it remediates; this
+  # one deliberately makes pods unavailable. Sharing a cluster would let one
+  # test's fault become another's flake, and the resulting red check would read
+  # as a remediation bug. The two also install different things — this cluster
+  # gets a fault injector with cluster-wide privileges of its own — and keeping
+  # that off the remediation cluster keeps the zero-writes and convergence proofs
+  # above exactly as narrow as they were.
+  #
+  # It gates merges like every other check here. "Installs reproducibly on kind
+  # in CI and locally" is one of T3's done criteria, and the only thing that can
+  # hold it is the install running on every PR through the same script `task
+  # chaos:install` runs locally.
+  # ---------------------------------------------------------------------------
+  chaos:
+    name: chaos on kind
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: Install Task
+        uses: arduino/setup-task@v2
+        with:
+          version: 3.x
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      # No audit-policy mount here. The audit log exists to prove the OBSERVATION
+      # identity sent no mutating verb, which the job above proves on the cluster
+      # that matters for it. This cluster's whole purpose is mutating requests
+      # from the chaos identity, so the same log would be a list of the writes
+      # this job is asserting happen.
+      - name: Create kind cluster
+        uses: helm/kind-action@v1.10.0
+        with:
+          version: ${{ env.KIND_VERSION }}
+          node_image: ${{ env.KIND_NODE_IMAGE }}
+          cluster_name: ${{ env.CLUSTER_NAME }}-chaos
+          wait: 120s
+
+      # All three bundles, one per identity, because this job now runs a scenario
+      # that needs two of them at once.
+      #
+      # The chaos bundle is what the lifecycle tests authenticate as. The read-only
+      # bundle corroborates that a fault visibly landed, and having it here is also
+      # what proves the identities stay separate on a cluster where chaos is live
+      # (the chaos SA cannot read a pod, so the observation has to come from
+      # somewhere else). The write bundle is new: T5's timing case, live, injects a
+      # real experiment into the target of an approved REMEDIATION, so the run needs
+      # the executor identity — the one that could actually have written — for the
+      # assertion "no write reached the cluster" to be about MaKlaude's re-check
+      # rather than about a missing permission.
+      - name: Apply the read-only, write and chaos RBAC bundles
+        run: |
+          set -euo pipefail
+          kubectl apply -k deploy/rbac
+          kubectl apply -k deploy/rbac/write
+          kubectl apply -k deploy/rbac/chaos
+          kubectl -n maklaude get serviceaccount maklaude
+          kubectl -n maklaude get serviceaccount maklaude-executor
+          kubectl -n maklaude get serviceaccount maklaude-chaos
+
+      # The same script `task chaos:install` runs. Pinned chart version, kind's
+      # containerd socket, and a wait that covers both the Deployments being ready
+      # and the CRD plus admission webhook actually serving — because what runs
+      # next creates a PodChaos, and a race here would read as a flaky test rather
+      # than as an install that had not finished.
+      - name: Install Chaos Mesh
+        run: task chaos:install
+
+      # Now that the CRD exists, discovery can resolve `podchaos`, so these use
+      # plain `kubectl auth can-i`. The job above asserts the same grants through
+      # SubjectAccessReviews precisely because it has no CRD; this is the
+      # complementary check that the Role works against a real resource type.
+      #
+      # `list` is the verb T3 added, and it is the one worth asserting most
+      # carefully: it is what the reaper needs, and granting it is what makes a
+      # sweep possible at all.
+      - name: Verify the chaos Role against the real CRD
+        run: |
+          set -euo pipefail
+          CHAOS=system:serviceaccount:maklaude:maklaude-chaos
+          SA=system:serviceaccount:maklaude:maklaude
+          echo "Grants for $CHAOS in maklaude-chaos:"
+          kubectl auth can-i --list --as="$CHAOS" -n maklaude-chaos || true
+
+          fail=0
+          assert_yes() {
+            if [ "$(kubectl auth can-i "$@" 2>/dev/null)" != "yes" ]; then
+              echo "::error::expected ALLOWED but denied: $*"; fail=1
+            fi
+          }
+          assert_no() {
+            if [ "$(kubectl auth can-i "$@" 2>/dev/null)" = "yes" ]; then
+              echo "::error::expected DENIED but allowed: $*"; fail=1
+            fi
+          }
+
+          # The injector's and reaper's exact call set, in the one namespace
+          # experiment objects live.
+          assert_yes get    podchaos.chaos-mesh.org --as="$CHAOS" -n maklaude-chaos
+          assert_yes list   podchaos.chaos-mesh.org --as="$CHAOS" -n maklaude-chaos
+          assert_yes create podchaos.chaos-mesh.org --as="$CHAOS" -n maklaude-chaos
+          assert_yes delete podchaos.chaos-mesh.org --as="$CHAOS" -n maklaude-chaos
+
+          # Adding `list` must not have widened anything else.
+          assert_no  watch            podchaos.chaos-mesh.org --as="$CHAOS" -n maklaude-chaos
+          assert_no  deletecollection podchaos.chaos-mesh.org --as="$CHAOS" -n maklaude-chaos
+          assert_no  update           podchaos.chaos-mesh.org --as="$CHAOS" -n maklaude-chaos
+          assert_no  patch            podchaos.chaos-mesh.org --as="$CHAOS" -n maklaude-chaos
+          assert_no  list             podchaos.chaos-mesh.org --as="$CHAOS" -n default
+          assert_no  create           networkchaos.chaos-mesh.org --as="$CHAOS" -n maklaude-chaos
+
+          # The "before" of a before/after pair, and the reason this line sits in THIS
+          # step rather than the later one: nothing has granted chaos in the target
+          # namespace yet, so the identical assertion passing as `assert_yes` two steps
+          # from now is caused by the apply in between and by nothing else. Without this
+          # reading, an unconditionally-permissive cluster would satisfy the later check.
+          assert_no  create           podchaos.chaos-mesh.org --as="$CHAOS" -n maklaude-chaos-target
+
+          # The chaos identity still cannot touch a workload itself: Chaos Mesh
+          # does the killing, with its own privileges, and that boundary is the
+          # reason for a third identity.
+          assert_no  list   pods --as="$CHAOS" -A
+          assert_no  delete pods --as="$CHAOS" -A
+          assert_no  get    secrets --as="$CHAOS" -A
+
+          # And the observation identity gained no chaos from any of this.
+          assert_no  create podchaos.chaos-mesh.org --as="$SA" -n maklaude-chaos
+          assert_no  list   podchaos.chaos-mesh.org --as="$SA" -n maklaude-chaos
+          assert_yes list   pods --as="$SA" -A
+
+          [ "$fail" -eq 0 ] || { echo "chaos Role assertions failed against the real CRD"; exit 1; }
+          echo "The chaos Role is exactly the injector's and reaper's call set."
+
+      - name: Seed the chaos target workloads
+        run: |
+          set -euo pipefail
+          kubectl apply -f test/e2e/manifests/chaos-target.yaml
+          kubectl -n maklaude-chaos-target rollout status deployment/victim --timeout=180s
+
+          # The crashlooping workload T5's live timing case remediates. Deliberately no
+          # `rollout status` wait: this Deployment never becomes available — that is the
+          # fault — so waiting for it would time out by design. The test waits for
+          # MaKlaude's own detector to report the crashloop instead, which is the fact
+          # its proposal will rest on.
+          kubectl apply -f test/e2e/manifests/chaos-remediation-target.yaml
+          kubectl -n maklaude-chaos-target get pods -o wide
+
+      # The fourth gate, and the one that has to be opened per namespace rather than
+      # once: Chaos Mesh's permission validation (`vauth.kb.io`, on by default and
+      # pinned on by the install script) authorizes a create by reviewing `create
+      # podchaos.chaos-mesh.org` in every namespace the experiment's SELECTOR names.
+      # The chaos Role covers maklaude-chaos, where the OBJECT goes; it says nothing
+      # about the namespace the fault lands in, so without this apply every experiment
+      # below is denied by admission.
+      #
+      # Applied with `-n` rather than carrying a namespace, which is the whole design
+      # of these two files: which namespaces may be broken is an explicit act by a
+      # person, and `default` deliberately gets no grant so the negative control in
+      # test/e2e/chaos_test.go has something to be refused by.
+      - name: Grant chaos in the target namespace (the per-namespace capability)
+        run: |
+          set -euo pipefail
+          kubectl apply -f deploy/rbac/chaos/target-namespace-role.yaml        -n maklaude-chaos-target
+          kubectl apply -f deploy/rbac/chaos/target-namespace-rolebinding.yaml -n maklaude-chaos-target
+          kubectl -n maklaude-chaos-target get role,rolebinding maklaude-chaos-target
+
+      # What the grant did and — mostly — what it did not do. The denials matter more
+      # than the one permission: this Role is held in a namespace full of somebody's
+      # real workloads, so "may break this namespace" must confer no ability to read
+      # one, touch one, or leave an experiment object behind where no sweep can reach
+      # it.
+      - name: Verify the target-namespace capability is exactly that
+        run: |
+          set -euo pipefail
+          CHAOS=system:serviceaccount:maklaude:maklaude-chaos
+          SA=system:serviceaccount:maklaude:maklaude
+          echo "Grants for $CHAOS in maklaude-chaos-target:"
+          kubectl auth can-i --list --as="$CHAOS" -n maklaude-chaos-target || true
+
+          fail=0
+          assert_yes() {
+            if [ "$(kubectl auth can-i "$@" 2>/dev/null)" != "yes" ]; then
+              echo "::error::expected ALLOWED but denied: $*"; fail=1
+            fi
+          }
+          assert_no() {
+            if [ "$(kubectl auth can-i "$@" 2>/dev/null)" = "yes" ]; then
+              echo "::error::expected DENIED but allowed: $*"; fail=1
+            fi
+          }
+
+          # The one verb, which is precisely the SubjectAccessReview the webhook runs.
+          assert_yes create podchaos.chaos-mesh.org --as="$CHAOS" -n maklaude-chaos-target
+
+          # And nothing else on the experiment kind here. `list` and `delete` are the
+          # dangerous-looking absences: the reaper sweeps maklaude-chaos alone, so a
+          # target namespace MaKlaude could enumerate would be one where an object could
+          # be created and never collected.
+          for verb in get list delete deletecollection update patch watch; do
+            assert_no "$verb" podchaos.chaos-mesh.org --as="$CHAOS" -n maklaude-chaos-target
+          done
+
+          # The workload it is now allowed to break stays unreadable and untouchable.
+          # Chaos Mesh does the breaking, with its own privileges.
+          for verb in get list delete patch; do
+            assert_no "$verb" pods --as="$CHAOS" -n maklaude-chaos-target
+          done
+          # `--subresource=exec` rather than `pods/exec`: can-i reads a slash as
+          # TYPE/NAME, so `pods/exec` would ask about a pod NAMED exec and pass
+          # vacuously for the wrong reason.
+          assert_no create pods --subresource=exec --as="$CHAOS" -n maklaude-chaos-target
+          assert_no get    secrets --as="$CHAOS" -n maklaude-chaos-target
+          assert_no patch  deployments.apps --as="$CHAOS" -n maklaude-chaos-target
+
+          # The allowlist is a list: one namespace was granted, so every other namespace
+          # must still refuse. `default` is the one the Go negative control aims at.
+          assert_no create podchaos.chaos-mesh.org --as="$CHAOS" -n default
+          assert_no create podchaos.chaos-mesh.org --as="$CHAOS" -n kube-system
+
+          # A cluster-scoped experiment — a selector naming no namespace at all — needs
+          # cluster-wide create, which no namespaced Role can confer. internal/chaos
+          # refuses to compose such a selector too; this is the other layer saying no.
+          assert_no create podchaos.chaos-mesh.org --as="$CHAOS" --all-namespaces
+
+          # And granting a namespace to the chaos identity granted nothing to the
+          # identity every read uses.
+          assert_no create podchaos.chaos-mesh.org --as="$SA" -n maklaude-chaos-target
+          assert_no create podchaos.chaos-mesh.org --as="$SA" -n maklaude-chaos
+
+          [ "$fail" -eq 0 ] || { echo "the target-namespace grant is not the one check it is meant to be"; exit 1; }
+          echo "maklaude-chaos may aim chaos at maklaude-chaos-target, and may do nothing else there."
+
+      # The reaper's negative control: an experiment MaKlaude did not create,
+      # wearing MaKlaude's own ownership labels. If a sweep ever deletes it, the
+      # production equivalent is MaKlaude cancelling an engineer's experiment
+      # mid-run on a shared Chaos Mesh.
+      - name: Seed the operator's own experiment (the reaper must not touch it)
+        run: |
+          set -euo pipefail
+          kubectl apply -f test/e2e/manifests/chaos-foreign.yaml
+          kubectl -n maklaude-chaos get podchaos operator-own-experiment
+
+      - name: Mint the chaos and read-only ServiceAccount kubeconfigs
+        run: |
+          set -euo pipefail
+          CTX="${CLUSTER_NAME}-chaos"
+          SERVER=$(kubectl config view --minify -o jsonpath='{.clusters[0].cluster.server}')
+          kubectl config view --minify --raw \
+            -o jsonpath='{.clusters[0].cluster.certificate-authority-data}' | base64 -d > "${RUNNER_TEMP}/ca.crt"
+
+          # Two separate files with two separate credentials, for the same reason
+          # the job above keeps the executor's apart from the observer's: a mix-up
+          # must fail as "no such credential" rather than silently test the wrong
+          # identity.
+          mint() {
+            sa="$1"; out="$2"
+            token=$(kubectl -n maklaude create token "$sa" --duration=1h)
+            kubectl --kubeconfig "$out" config set-cluster "$CTX" \
+              --server="$SERVER" --certificate-authority="${RUNNER_TEMP}/ca.crt" --embed-certs=true
+            kubectl --kubeconfig "$out" config set-credentials "$sa" --token="$token"
+            kubectl --kubeconfig "$out" config set-context "$CTX" --cluster="$CTX" --user="$sa"
+            kubectl --kubeconfig "$out" config use-context "$CTX"
+            chmod 600 "$out"
+          }
+
+          mint maklaude-chaos    "${RUNNER_TEMP}/maklaude-chaos.kubeconfig"
+          mint maklaude          "${RUNNER_TEMP}/maklaude-sa.kubeconfig"
+          mint maklaude-executor "${RUNNER_TEMP}/maklaude-executor.kubeconfig"
+
+          echo "MAKLAUDE_E2E_CHAOS_KUBECONFIG=${RUNNER_TEMP}/maklaude-chaos.kubeconfig" >> "$GITHUB_ENV"
+          echo "MAKLAUDE_E2E_KUBECONFIG=${RUNNER_TEMP}/maklaude-sa.kubeconfig" >> "$GITHUB_ENV"
+          echo "MAKLAUDE_E2E_EXECUTOR_KUBECONFIG=${RUNNER_TEMP}/maklaude-executor.kubeconfig" >> "$GITHUB_ENV"
+          echo "MAKLAUDE_E2E_CONTEXT=${CTX}" >> "$GITHUB_ENV"
+
+      # The control that keeps the live timing case honest. Its central assertion is
+      # that no real write reached the cluster; that assertion is only about MaKlaude's
+      # precondition re-check if the identity making it COULD have written. So: the
+      # executor may perform the restart it is about to abandon, and the chaos identity
+      # still may not — the two deltas do not overlap, on a cluster where both are
+      # installed.
+      - name: Verify the executor identity can write what the drift scenario abandons
+        run: |
+          set -euo pipefail
+          EXEC=system:serviceaccount:maklaude:maklaude-executor
+          CHAOS=system:serviceaccount:maklaude:maklaude-chaos
+
+          fail=0
+          assert_yes() {
+            if [ "$(kubectl auth can-i "$@" 2>/dev/null)" != "yes" ]; then
+              echo "::error::expected ALLOWED but denied: $*"; fail=1
+            fi
+          }
+          assert_no() {
+            if [ "$(kubectl auth can-i "$@" 2>/dev/null)" = "yes" ]; then
+              echo "::error::expected DENIED but allowed: $*"; fail=1
+            fi
+          }
+
+          # A rollout restart is a PATCH of the Deployment, and the runner re-reads the
+          # target before sending, so the executor needs both verbs here.
+          assert_yes patch deployments.apps --as="$EXEC" -n maklaude-chaos-target
+          assert_yes get   deployments.apps --as="$EXEC" -n maklaude-chaos-target
+          assert_yes list  pods             --as="$EXEC" -n maklaude-chaos-target
+
+          # Installing the write bundle granted the executor no chaos, and the chaos
+          # identity gained no ability to touch the workload it may break.
+          assert_no create podchaos.chaos-mesh.org --as="$EXEC"  -n maklaude-chaos
+          assert_no create podchaos.chaos-mesh.org --as="$EXEC"  -n maklaude-chaos-target
+          assert_no patch  deployments.apps       --as="$CHAOS" -n maklaude-chaos-target
+
+          [ "$fail" -eq 0 ] || { echo "the executor/chaos identity split is not what the drift scenario assumes"; exit 1; }
+          echo "maklaude-executor may restart the remediable Deployment; maklaude-chaos may not touch it."
+
+      - name: Run the chaos e2e (lifecycle, eligibility, and the live timing case)
+        env:
+          MAKLAUDE_E2E_CHAOS_KUBECONFIG: ${{ env.MAKLAUDE_E2E_CHAOS_KUBECONFIG }}
+          MAKLAUDE_E2E_KUBECONFIG: ${{ env.MAKLAUDE_E2E_KUBECONFIG }}
+          MAKLAUDE_E2E_EXECUTOR_KUBECONFIG: ${{ env.MAKLAUDE_E2E_EXECUTOR_KUBECONFIG }}
+          MAKLAUDE_E2E_CONTEXT: ${{ env.MAKLAUDE_E2E_CONTEXT }}
+        run: task e2e:chaos
+
+      # The milestone's worst outcome, asserted on the way out rather than assumed:
+      # nothing of MaKlaude's is left on the cluster, and the operator's own
+      # experiment still is. This runs `always()` so it reports on a failed run
+      # too — a leak is most likely precisely when a test failed partway through,
+      # and that is the case a passing-run-only check would never see.
+      - name: Assert no MaKlaude experiment leaked
+        if: always()
+        run: |
+          set -euo pipefail
+          echo "=== every PodChaos on the cluster ==="
+          kubectl get podchaos -A -o wide || true
+
+          # Bounded poll rather than one instant read, because a correct system fails an
+          # instant read. Chaos Mesh holds a finalizer on every experiment and clears it
+          # only after its controller has recovered the fault, so an object whose delete
+          # was accepted seconds ago is legitimately still listed, in Terminating. The
+          # leak this step exists to catch is residue that does NOT go away, so the
+          # question is asked for 90 seconds before it is answered — and the
+          # deletionTimestamp is printed on failure, since "stuck mid-recovery" and
+          # "never deleted at all" need different fixes and look identical in a name list.
+          list_leaked() {
+            kubectl get podchaos -A \
+              -l app.kubernetes.io/managed-by=maklaude,app.kubernetes.io/component=chaos \
+              -o jsonpath='{range .items[*]}{.metadata.namespace}/{.metadata.name}{"\n"}{end}' \
+              | grep -E '/maklaude-[a-z0-9]+-[0-9a-f]{12}$' || true
+          }
+
+          deadline=$(( $(date +%s) + 90 ))
+          while :; do
+            leaked=$(list_leaked)
+            [ -z "$leaked" ] && break
+            if [ "$(date +%s)" -ge "$deadline" ]; then
+              echo "::error::MaKlaude experiments outlived the run:"
+              echo "$leaked"
+              echo "=== with deletion timestamps (empty means never deleted, set means recovery is stuck) ==="
+              kubectl get podchaos -A \
+                -l app.kubernetes.io/managed-by=maklaude,app.kubernetes.io/component=chaos \
+                -o custom-columns='NS:.metadata.namespace,NAME:.metadata.name,DELETED:.metadata.deletionTimestamp,FINALIZERS:.metadata.finalizers' || true
+              exit 1
+            fi
+            echo "still terminating, waiting for Chaos Mesh to finish recovery:"
+            echo "$leaked"
+            sleep 5
+          done
+          echo "No MaKlaude-derived experiment objects remain."
+
+          # The other half: the sweep must not have taken the operator's with it.
+          if ! kubectl -n maklaude-chaos get podchaos operator-own-experiment >/dev/null 2>&1; then
+            echo "::error::the operator's own experiment is gone; a sweep deleted an experiment MaKlaude did not create"
+            exit 1
+          fi
+          echo "The operator's own experiment is untouched."
+
+      - name: Diagnostics on failure
+        if: failure()
+        run: |
+          echo "=== chaos-mesh pods ==="
+          kubectl -n chaos-mesh get pods -o wide || true
+          kubectl -n chaos-mesh describe pods || true
+          echo "=== chaos-mesh controller logs ==="
+          kubectl -n chaos-mesh logs -l app.kubernetes.io/component=controller-manager --tail=200 || true
+          echo "=== experiments ==="
+          kubectl get podchaos -A -o yaml || true
+          echo "=== target workload ==="
+          kubectl -n maklaude-chaos-target get deployments,pods -o wide || true
+          kubectl -n maklaude-chaos-target describe pods || true

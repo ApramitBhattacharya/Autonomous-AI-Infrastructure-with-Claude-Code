@@ -1,0 +1,212 @@
+# MaKlaude cluster registry — example configuration.
+#
+# This file declares the Kubernetes clusters MaKlaude operates on your behalf.
+# Copy it (e.g. to `config.yaml`), edit the values, and point MaKlaude at it.
+#
+# SECRET-SAFE BY DESIGN: this file references clusters by *path* only. It never
+# contains credentials, tokens, or certificate data — only the filesystem path
+# to an existing kubeconfig and the context to select within it. Never commit a
+# real kubeconfig or any credentials to version control.
+
+clusters:
+  # Each entry must have a unique `name`, a `kubeconfig` path, and a `context`.
+  - name: prod-us-east           # unique, human-friendly identifier
+    kubeconfig: /home/alice/.kube/prod-us-east.yaml  # path to an existing kubeconfig file
+    context: prod-us-east        # context to select within that kubeconfig
+
+  - name: staging
+    kubeconfig: ~/.kube/config   # a leading "~" is expanded to your home directory
+    context: staging
+
+# ---------------------------------------------------------------------------
+# OPTIONAL: CHAOS ELIGIBILITY (Milestone 6) — OFF BY DEFAULT, PER CLUSTER.
+#
+# This is the ONE thing in this file that lets MaKlaude break a cluster on
+# purpose, and it is off for every cluster above because the key is absent. A
+# config written before this milestone stays ineligible, unchanged.
+#
+# Eligibility is per cluster, never global, and it is not a boolean. The marker
+# is a two-part acknowledgement that NAMES THE CLUSTER IT APPLIES TO, because
+# the realistic accident is not a typo — it is copying a config block from a
+# scratch cluster onto a production one. `chaos: true` survives that copy
+# silently. A sentence naming `kind-maklaude` does not: pasted under `prod` it
+# names the wrong cluster, and MaKlaude refuses the whole config saying so.
+#
+# To mark a cluster eligible, add this UNDER that cluster's entry, with BOTH the
+# `cluster` field and the name inside the sentence matching that cluster's name
+# exactly:
+#
+#   - name: kind-maklaude
+#     kubeconfig: ~/.kube/config
+#     context: kind-maklaude
+#     chaos:
+#       cluster: kind-maklaude
+#       acknowledgement: >-
+#         I accept that MaKlaude may deliberately break the cluster named
+#         kind-maklaude
+#
+# The sentence is compared exactly, word for word and case for case; only line
+# wrapping is forgiven (the `>-` above folds it onto one line). "yes", "true", a
+# reworded variant, or a name that doesn't match are each rejected with an error
+# naming what to fix. A partially-written block is an error too, not a silent
+# downgrade — you should never be left believing you marked a cluster when you
+# did not.
+#
+# There is no commented-out live example to un-comment, on purpose. Marking a
+# cluster eligible means typing that cluster's name twice yourself.
+#
+# What eligibility does NOT do: it grants nothing on its own. Chaos Mesh must be
+# installed, a SEPARATE ServiceAccount and RBAC bundle must be applied, and every
+# experiment still passes the same gates a remediation does — the blast-radius
+# budget, the cooldown, and the circuit breaker. Injecting a fault ALWAYS asks a
+# human; unlike a remediation, it can never be promoted to run unattended, because
+# a run of clean injections says the injector works, not that the next one is safe.
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# OPTIONAL: LLM-assisted diagnosis (Milestone 3 / T5) — OFF BY DEFAULT.
+#
+# MaKlaude's root-cause diagnosis is deterministic and fully functional on its
+# own. You can OPTIONALLY let a Claude model *refine* those hypotheses for cases
+# the rules handle poorly. This is the one place cluster-derived data could leave
+# the process, so it is strictly gated and configured via ENVIRONMENT VARIABLES,
+# never this file — this config is secret-safe by design and must never hold an
+# API key. The layer is:
+#   - read-only          the model can only propose explanations, never actions;
+#   - redacted           secret values, tokens, and PII are stripped BEFORE egress;
+#   - cost-bounded        size/token caps, a per-cycle call budget, and timeouts;
+#   - gracefully degrading unconfigured/erroring/over-budget ⇒ deterministic output;
+#   - audited            every call's purpose and outcome is logged.
+#
+# Enable it by setting BOTH the feature flag and an API key (double opt-in):
+#   export MAKLAUDE_LLM_DIAGNOSIS=true        # explicit feature flag (off unless set)
+#   export MAKLAUDE_LLM_API_KEY=sk-ant-...    # Claude API key (or ANTHROPIC_API_KEY)
+# Optional tuning (sensible, conservative defaults apply when unset):
+#   export MAKLAUDE_LLM_MODEL=claude-sonnet-5 # model id (default: claude-sonnet-5)
+#   export MAKLAUDE_LLM_API_BASE=https://...  # API base override (proxy/gateway)
+#   export MAKLAUDE_LLM_MAX_EVIDENCE=8000     # max redacted evidence bytes per call
+#   export MAKLAUDE_LLM_MAX_TOKENS=1024       # max response tokens per call
+#   export MAKLAUDE_LLM_CALL_BUDGET=8         # max provider calls per scan cycle
+#   export MAKLAUDE_LLM_TIMEOUT=20s           # per-call timeout (Go duration)
+# With the flag unset (the default), diagnosis behaves exactly as without T5.
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# REMEDIATION (Milestone 4) — OFF BY DEFAULT, AND NOT CONFIGURABLE FROM THIS FILE.
+#
+# MaKlaude can carry out four remediations a human approved: rolloutrestart,
+# rollbackrevision, cordonnode, deletepod. There is deliberately NO key in this
+# file that turns any of that on. Off is not a default someone could flip by
+# accident here.
+#
+# The write path IS reachable from the shipped binary, and only from one command:
+# `maklaude remediate`. `maklaude scan` cannot execute anything — that is why the
+# two are separate commands rather than one command with a flag, so scan's promise
+# that nothing it does can change a cluster is not weakenable by an argument.
+#
+# `remediate` is itself propose-only until an operator sets ONE environment
+# variable, and with that variable unset it constructs no write-capable client at
+# all — the same posture as before it was wired up:
+#
+#   export MAKLAUDE_EXECUTE_MODE=disabled   # default (and unset). Propose only.
+#   export MAKLAUDE_EXECUTE_MODE=dry-run    # full cycle, every request dryRun=All.
+#   export MAKLAUDE_EXECUTE_MODE=enabled    # an approved action changes the cluster.
+#
+# An unrecognized value is a fatal startup error, not a silent fallback in either
+# direction. Setting it is necessary and NOT sufficient — every gate below still
+# applies, and none of them was relaxed to make the command reachable.
+#
+# An action has to pass five independent gates. Each is opened by a different
+# person doing a different thing, and none implies another:
+#
+#   1. RBAC        `kubectl apply -k deploy/rbac/write` — a SEPARATE bundle
+#                  binding a SEPARATE ServiceAccount (maklaude-executor). Not
+#                  installed by `kubectl apply -k deploy/rbac`. Deleting it is
+#                  the cheapest kill: writes stop at the API server, and the
+#                  read / diagnose / propose path keeps working untouched.
+#   2. KILL SWITCH `kube.ExecuteMode`, fixed when the executor is constructed.
+#                  disabled (zero value, default) | dry-run | enabled.
+#                  Under `disabled`, kube.NewExecutor refuses to build anything,
+#                  so an opted-out deployment holds no write-capable object.
+#                  NOTE: a dry run still needs the write RBAC verb — Kubernetes
+#                  authorizes dryRun=All with the identical verb.
+#   3. APPROVAL    an `approved` LABEL EVENT on the proposal issue, from an
+#                  identity MaKlaude cannot forge. Scope-bound and single-use:
+#                  one operation, one object, one resourceVersion, once.
+#   4. PRECONDITIONS re-checked against a fresh cluster read immediately before
+#                  the request is sent.
+#   5. resourceVersion injected by the executor and enforced by the API server.
+#                  A target that moved since the proposal fails and applies
+#                  nothing.
+#
+# The approval flow is configured by ENVIRONMENT VARIABLES, not this file:
+#   export MAKLAUDE_GITHUB_REPO=owner/repo    # where proposal artifacts live
+#   export MAKLAUDE_GITHUB_TOKEN=...          # token with issues:write
+#   export MAKLAUDE_GITHUB_SELF_LOGIN=...     # the login that token belongs to;
+#                                             # REQUIRED with a live gate, so a
+#                                             # label MaKlaude applied to its own
+#                                             # artifact is recognized + refused
+#
+# And there is exactly one supported way to waive the human requirement — it
+# waives CONSENT and nothing else (gates 1, 2, 4 and 5 above all still apply):
+#   export MAKLAUDE_DANGEROUSLY_AUTO_APPROVE=1
+# Strict values: 1/true on, 0/false/unset off, anything else is a fatal startup
+# error rather than a guess. Every action it waives is recorded as unreviewed.
+# Read docs/autonomous-mode.md BEFORE setting it.
+#
+# Full story: docs/remediation.md. Access model: docs/rbac.md.
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# EARNED AUTONOMY (Milestone 5) — OFF BY DEFAULT, AND NOT CONFIGURABLE FROM THIS FILE.
+#
+# There is a second way for an action to be authorized, narrower than the blanket
+# bypass above: a rule an operator wrote, for a (cluster, operation) shape that a
+# recorded history of human approvals has EARNED. It adds a sixth condition on top
+# of the five gates above and removes none of them.
+#
+# It is off by default in the same sense the write path is: not a flag set to false,
+# but a rule that does not exist. With MAKLAUDE_AUTONOMY_RULES unset, every proposal
+# takes the human gate — byte for byte the behaviour above.
+#
+# The grant lives in ITS OWN FILE, not here, and there is deliberately no key in
+# this file that reaches it. This file is copied, templated and committed, and "the
+# checked-in example turned autonomy on" is a failure mode worth designing out.
+#
+#   export MAKLAUDE_AUTONOMY_RULES=/etc/maklaude/autonomy.yaml        # the grant
+#   export MAKLAUDE_TRUST_LEDGER=/var/lib/maklaude/trust.jsonl        # the history
+#   export MAKLAUDE_AUTONOMY_STATE=/var/lib/maklaude/autonomy-state.json  # the ceiling
+#
+# All three are required TOGETHER: setting the first without the other two makes
+# `maklaude remediate` refuse to start, naming the variable to fix. Rules with no
+# ledger could never promote a shape, and rules with no ceiling have nothing
+# bounding them — either one is autonomy that is configured, valid, and silently
+# unable to fire, which looks exactly like autonomy that is on and has earned
+# nothing yet.
+#
+# EARNED IS NOT THE SAME AS WAIVED. The bypass above means a person waived review
+# for everything and cites nothing; an earned rule means a person approved that
+# exact shape repeatedly, it converged, and the ledger promoted it — and the
+# citation is required, so a claim of trust with no history behind it is refused.
+# The two record different authorizing identities (`policy:<rule-name>` versus
+# `policy:MAKLAUDE_DANGEROUSLY_AUTO_APPROVE`) and travel on different trails.
+#
+# THERE IS NO WAY TO DECLARE TRUST. No seed, no bootstrap list, no "start trusted".
+# On day one nothing is trusted and everything gates, by design. Promotion needs 3
+# human-approved executions of the shape that converged, with zero failures,
+# rollbacks or drift-aborts among the last 10 recorded executions of it.
+#
+# The bounds are fixed and NOT configurable — a rules file can narrow what runs
+# unattended, never raise the ceiling: 2 auto-applies per cluster per pass, a
+# 30-minute cooldown per target, and a per-cluster circuit breaker that trips after
+# 2 consecutive auto-apply failures and takes that cluster fully gated until a human
+# clears it. A tripped breaker is printed in the state summary every pass.
+#
+# Every unattended action opens its own GitHub issue BEFORE it runs, so a live
+# comms trail (MAKLAUDE_GITHUB_REPO + MAKLAUDE_GITHUB_TOKEN) is required: with no
+# durable place to record it, autonomy stays off and the report says so. Adding the
+# `autonomy:revoked` label to any such issue revokes that shape.
+#
+# Format and a worked example: autonomy.example.yaml.
+# Full story, including how to revoke: docs/unattended-actions.md.
+# ---------------------------------------------------------------------------

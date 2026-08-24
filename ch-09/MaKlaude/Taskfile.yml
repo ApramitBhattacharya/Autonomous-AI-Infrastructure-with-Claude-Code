@@ -1,0 +1,168 @@
+# Taskfile for MaKlaude — https://taskfile.dev
+#
+# This project uses Task as its sole task runner. There is intentionally NO
+# Makefile and `make` is never used anywhere in this repository.
+#
+# Run `task --list` to see available tasks.
+version: "3"
+
+vars:
+  BIN_DIR: bin
+  BINARY: maklaude
+  PKG: ./cmd/maklaude
+  GOLANGCI_LINT_VERSION: v1.64.8
+
+tasks:
+  default:
+    desc: Show available tasks
+    cmds:
+      - task --list
+    silent: true
+
+  tidy:
+    desc: Tidy and verify go.mod / go.sum
+    cmds:
+      - go mod tidy
+      - go mod verify
+
+  build:
+    desc: Build the maklaude binary into ./bin
+    cmds:
+      - go build -o {{.BIN_DIR}}/{{.BINARY}} {{.PKG}}
+
+  test:
+    desc: Run unit tests with race detector and coverage
+    cmds:
+      - go test -race -coverprofile=coverage.out ./...
+
+  e2e:
+    desc: |
+      Run the end-to-end test against a live cluster. Requires a kind cluster
+      seeded with the failure scenarios and these env vars:
+        MAKLAUDE_E2E_KUBECONFIG           path to the read-only ServiceAccount kubeconfig
+        MAKLAUDE_E2E_EXECUTOR_KUBECONFIG  path to the maklaude-executor kubeconfig
+                                          (deploy/rbac/write must be applied)
+        MAKLAUDE_E2E_CONTEXT              context to select within both kubeconfigs
+        MAKLAUDE_E2E_AUDIT_LOG            (optional) apiserver audit log for corroboration
+      MAKLAUDE_GITHUB_* MUST be unset so escalation stays an in-memory dry-run.
+      This target only runs the Go test; the kind cluster + seeding is driven by
+      the CI e2e job (see .github/workflows/e2e.yml).
+    cmds:
+      # The timeout is raised from Go's 10-minute default deliberately. This suite
+      # WAITS on real clusters — a 150s convergence window per gated remediation, a
+      # bounded window that must expire in full for the circuit-breaker scenario, and a
+      # health re-scan after each — so 10 minutes is now inside the range of a passing
+      # run. A test binary killed by the default timeout panics with no failing
+      # assertion, which reads as a broken harness rather than as "the suite got
+      # longer".
+      - go test -tags e2e -count=1 -timeout 30m -v ./test/e2e/...
+
+  e2e:chaos:
+    desc: |
+      Run ONLY the chaos e2e tests — lifecycle, eligibility, and the live timing case
+      — against a kind cluster that has Chaos Mesh installed (`task chaos:install`) and
+      both chaos seeds applied (test/e2e/manifests/chaos-target.yaml and
+      chaos-remediation-target.yaml). Env vars:
+        MAKLAUDE_E2E_CHAOS_KUBECONFIG     the maklaude-chaos ServiceAccount kubeconfig
+                                          (deploy/rbac/chaos must be applied)
+        MAKLAUDE_E2E_KUBECONFIG           (optional) read-only SA kubeconfig, used only
+                                          to corroborate that the fault visibly landed
+        MAKLAUDE_E2E_EXECUTOR_KUBECONFIG  the maklaude-executor kubeconfig
+                                          (deploy/rbac/write must be applied). Required
+                                          by the live timing case, which injects a real
+                                          experiment into the target of an approved
+                                          remediation: the identity under test is the
+                                          one that could have written.
+        MAKLAUDE_E2E_CONTEXT              context to select within the kubeconfigs
+      It is a separate target from `e2e` because the two need different clusters: this
+      one installs a fault injector, and the remediation suite asserts convergence on
+      workloads a live experiment would disturb. The chaos test SKIPS under `task e2e`
+      when its kubeconfig is unset, so the main suite is unaffected either way.
+    cmds:
+      - go test -tags e2e -count=1 -timeout 20m -v -run 'TestE2E_Chaos' ./test/e2e/...
+
+  chaos:install:
+    desc: |
+      Install Chaos Mesh into the current kind cluster, pinned and idempotent.
+      Wraps scripts/install-chaos-mesh.sh, which the CI chaos job also calls — so a
+      failure reproduced locally runs the same code CI ran, and the pinned version has
+      exactly one home. The script refuses any cluster that does not look like kind.
+        KUBE_CONTEXT  optional context to select
+    cmds:
+      - bash scripts/install-chaos-mesh.sh
+
+  chaos:uninstall:
+    desc: |
+      Remove the Chaos Mesh release from the current kind cluster. Leaves the CRDs in
+      place deliberately: deleting a CRD cascades to every custom resource of that
+      kind, including experiments MaKlaude did not create.
+    cmds:
+      - bash scripts/install-chaos-mesh.sh --uninstall
+
+  vet:
+    desc: Run go vet, including every build-tagged suite CI compiles
+    cmds:
+      # Plain `go vet ./...` SKIPS build-tagged files silently — not as a warning,
+      # as a no-op. Every file in test/e2e is behind `//go:build e2e`, so that
+      # package can fail to COMPILE while this gate reports green, which reads as
+      # a flaky or environment-specific CI problem rather than as a type error the
+      # author just introduced. PR #183 cost a full CI round exactly that way:
+      # seven compile errors in test/e2e/unattended_test.go from a signature the
+      # PR changed, found by `e2e on kind` only after it had built a cluster and
+      # seeded fault scenarios.
+      #
+      # The tagged pass type-checks those files without running them — no cluster,
+      # no credentials, no env vars, about a second — so it runs anywhere the rest
+      # of this target already runs. Do NOT delete it as redundant with the line
+      # above: the two passes vet disjoint sets of files, which is the whole point.
+      # TestVetCoversEveryBuildTag pins this list to the tags actually present in
+      # the tree, so adding a second build tag without a line here fails the build
+      # rather than silently reopening the hole.
+      - go vet ./...
+      - go vet -tags e2e ./...
+
+  fmt:
+    desc: Format all Go source files
+    cmds:
+      - gofmt -w .
+
+  fmt:check:
+    desc: Fail if any Go source file is not gofmt-clean
+    cmds:
+      - |
+        unformatted=$(gofmt -l .)
+        if [ -n "$unformatted" ]; then
+          echo "The following files are not gofmt-clean:"
+          echo "$unformatted"
+          exit 1
+        fi
+
+  lint:
+    desc: Run golangci-lint (auto-installs the pinned version if missing)
+    cmds:
+      - |
+        if ! command -v golangci-lint >/dev/null 2>&1; then
+          echo "golangci-lint not found; running pinned version via 'go run'..."
+          go run github.com/golangci/golangci-lint/cmd/golangci-lint@{{.GOLANGCI_LINT_VERSION}} run ./...
+        else
+          golangci-lint run ./...
+        fi
+
+  ci:
+    desc: Run the full quality gate (build + lint + test) — mirrors CI
+    cmds:
+      - task: build
+      - task: fmt:check
+      - task: vet
+      - task: lint
+      - task: test
+
+  check:
+    desc: Alias for the full quality gate
+    cmds:
+      - task: ci
+
+  clean:
+    desc: Remove build artifacts
+    cmds:
+      - rm -rf {{.BIN_DIR}} coverage.out

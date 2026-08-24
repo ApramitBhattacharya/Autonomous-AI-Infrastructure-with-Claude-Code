@@ -1,0 +1,126 @@
+name: Genesis Orchestrator (Scheduled)
+
+on:
+  schedule:
+    # Run every 6 hours
+    - cron: '0 */6 * * *'
+  workflow_dispatch: {}
+
+# Serialize all orchestrator activity across triggers (events, schedule, merge)
+# so two near-simultaneous triggers can't run two orchestrators and duplicate work.
+concurrency:
+  group: genesis-orchestrator-${{ github.repository }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  issues: write
+  pull-requests: write
+
+jobs:
+  orchestrate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/create-github-app-token@v3
+        id: app-token
+        with:
+          app-id: ${{ secrets.GENESIS_APP_ID }}
+          private-key: ${{ secrets.GENESIS_APP_PRIVATE_KEY }}
+          permission-contents: write
+          permission-issues: write
+          permission-pull-requests: write
+          permission-workflows: write
+
+      # Deterministic stale-gate check, BEFORE the agent step on purpose: an
+      # unanswered needs:human gate parks the project silently (every run
+      # correctly does nothing — see #84), and running this first means the
+      # nudge still escapes if the agent later dies at max-turns.
+      - name: Nudge stale human gates
+        run: bash .genesis/scripts/nudge-gates.sh
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          GH_REPO: ${{ github.repository }}
+
+      - uses: anthropics/claude-code-action@v1
+        with:
+          # CI authenticates with ANTHROPIC_API_KEY, deliberately. Do NOT "fix" this
+          # by swapping in claude_code_oauth_token — a subscription token bills a
+          # person's subscription for unattended automation. PR #152 made exactly
+          # that swap and was reverted in 2931732; see #150 for the reasoning.
+          # No valid key exists right now, so CI is dormant on purpose and local
+          # `genesis serve` (the CLI is already authenticated, no secret needed) is
+          # the only path. If CI matters again, supply a key — don't change this.
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          github_token: ${{ steps.app-token.outputs.token }}
+          allowed_bots: "genesis-dev-bot[bot]"
+          # Reaches the activity-logging hooks in .claude/settings.json. The
+          # `settings` input MERGES with the repo's settings, so the hooks survive.
+          # Unset secrets render as empty strings and log.sh falls back to stderr.
+          settings: |
+            {
+              "env": {
+                "GENESIS_LOKI_URL": "${{ secrets.GENESIS_LOKI_URL }}",
+                "GENESIS_LOKI_USER": "${{ secrets.GENESIS_LOKI_USER }}",
+                "GENESIS_LOKI_TOKEN": "${{ secrets.GENESIS_LOKI_TOKEN }}"
+              }
+            }
+          prompt: |
+            Run the orchestrator agent defined in .claude/agents/orchestrator.md.
+            This is a scheduled run — assess project state and advance work.
+
+            FIRST, as soon as you know what you intend to do this run (right after
+            assessing state, before any implementation), record it:
+              bash .genesis/scripts/checkpoint.sh "what I intend to do, and why"
+            If this run later dies at max-turns, that checkpoint is the only record
+            of your reasoning a human gets. One turn, before the unbounded work.
+
+            Immediately BEFORE you merge a PR or close a task issue, re-check for
+            a human comment nothing has answered:
+              bash .genesis/scripts/issues.sh unanswered-comments
+            A comment attaching conditions to work in flight is part of that
+            work's done criteria — satisfy them, or say which you are not
+            satisfying and why, before merging. `issues.sh summary` prints the
+            same section every run, but a comment can land in the minutes
+            between the summary you read and the merge you make: on #141 that
+            window was 2m25s and two of three requested cases never shipped.
+            See #156.
+          # 60, not 40: this is the only workflow that must BOTH assess full
+          # project state AND complete a unit of work in the same run, and it is
+          # the loop's last line of defence — the tick that picks up whatever the
+          # event/evolver runners dropped. At 40 it died `error_max_turns` at
+          # turn 41 (run 30194197251, #87) having just opened PR #86: the
+          # deliverable escaped but the bookkeeping — report, close, relabel —
+          # was truncated, and that is the part a human reads. Assess → read the
+          # issue → explore → write script + CLI subcommand + regression test →
+          # test → commit → push → open PR is ~40 turns with nothing left over.
+          # See #89. Floor enforced by test/devsystem/workflows_test.go.
+          claude_args: "--max-turns 60 --allowedTools Read,Write,Edit,Bash,Glob,Grep,Agent"
+
+      # Copy this run's transcript (reasoning + tool calls) off the runner
+      # before it is torn down, and BEFORE the escalation below, which renders
+      # the retention status. `always()`: a dying run's transcript is the one
+      # that matters most, and a healthy run's is the baseline it is read
+      # against. Sink is private Loki — `show_full_output` deliberately stays
+      # off, because run logs and artifacts are world-readable on this public
+      # repo. See #106 and .genesis/scripts/retain-transcript.sh.
+      - name: Retain agent transcript
+        if: always()
+        run: bash .genesis/scripts/retain-transcript.sh
+        env:
+          GENESIS_LOKI_URL: ${{ secrets.GENESIS_LOKI_URL }}
+          GENESIS_LOKI_USER: ${{ secrets.GENESIS_LOKI_USER }}
+          GENESIS_LOKI_TOKEN: ${{ secrets.GENESIS_LOKI_TOKEN }}
+
+      # Escalate a real run failure (e.g. agent hit max-turns) to a human. Runs
+      # only on job failure — no separate watcher workflow, so it adds zero
+      # skipped runs to the Actions tab; benign cancellations don't trigger it.
+      - name: Escalate on failure
+        if: failure()
+        run: bash .genesis/scripts/escalate.sh
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          GH_REPO: ${{ github.repository }}
+          WF_NAME: ${{ github.workflow }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}

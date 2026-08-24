@@ -1,0 +1,1726 @@
+"""Local orchestrator server (local control plane).
+
+Runs the orchestrator agent locally, polling GitHub repo events and launching
+fresh Claude sessions when relevant activity is detected. Disables GitHub
+Actions workflows on start to prevent duplicate execution; re-enables them on
+graceful shutdown.
+
+Authentication uses the user's existing `gh` CLI auth (`gh auth token`) for
+GitHub, and whatever the local `claude` CLI is already logged in with for the
+model — a Claude subscription works, so no ANTHROPIC_API_KEY is required. That
+is the main practical reason to prefer local mode: GitHub Actions needs a
+credential in the repo, this needs none.
+
+Configuration (environment variables):
+    GENESIS_POLL_INTERVAL    seconds between polls (default: 60)
+    GENESIS_SESSION_TIMEOUT  max seconds per orchestrator session (default: 3600)
+    GENESIS_REPO             owner/repo (default: detected from git remote)
+    GENESIS_AGENT            agent definition to run (default: the orchestrator)
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import shutil
+import signal
+import subprocess
+import sys
+import threading
+import time
+import urllib.error
+import urllib.request
+import uuid
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Iterable
+
+from genesis.appauth import mint_installation_token
+from genesis.automerge import merge_ready
+from genesis import triggers
+from genesis.workflows import (
+    DISABLED_LIST_PATH,
+    disable_workflows,
+    enable_workflows,
+    tracked_all_disabled,
+)
+
+LOCK_PATH = Path(".genesis/.orchestrator.lock")
+ETAG_PATH = Path(".genesis/.poll-etag")
+HIGHWATER_PATH = Path(".genesis/.poll-highwater")
+
+# The seeded issue manager, which owns the `in-progress` label: `claim` writes it
+# at pickup and `release` / `sweep-claims` take it back. The plane shells out to
+# it rather than reimplementing the same GitHub calls in Python, so both modes
+# release claims the same way and a dev system can invoke the same primitive.
+# Absent in a repo that doesn't use it, which every claim path treats as "there
+# is nothing here to release" rather than as an error.
+ISSUES_SCRIPT = Path(".genesis/scripts/issues.sh")
+
+# The dev repo's own pre-agent steps. A dev system is taught to turn a check that
+# needs no judgement into a script and wire it into workflow YAML *before* the
+# agent step - and then `serve` disables every workflow and launches `claude -p`
+# directly, so the script never runs. Measured (#44): a `nudge-gates.sh` written
+# precisely because a stale `needs:human` gate is the one failure with no safety
+# net (one sat 21 days across ~85 ticks) was correctly written, tested, placed,
+# and silently did not execute in the mode the project actually ran in.
+#
+# One conventional path rather than a manifest, for the reason the scaffolded
+# .gitignore stopped enumerating: a list of steps defaults the next member to
+# unsafe. A repo that wants several nets composes them inside this one script,
+# where forgetting is visible in a file it owns.
+PRE_SESSION_SCRIPT = Path(".genesis/scripts/pre-session.sh")
+
+# Where the harness reads its hook declarations. Consulted only to answer "is the
+# pre-session script already going to run on its own", so the plane doesn't run it
+# a second time.
+CLAUDE_SETTINGS = Path(".claude/settings.json")
+
+# Bounded and non-fatal, both deliberate. These run before every session, so a
+# hung net would wedge the loop it was written to protect, and a net that fails
+# is still a better outcome than a control plane that stops. The workflow-step
+# equivalent gets the runner's own timeout; this is that.
+PRE_SESSION_TIMEOUT_S = 120
+
+RELEVANT_EVENT_TYPES = frozenset(
+    {"IssuesEvent", "IssueCommentEvent", "PullRequestEvent"}
+)
+
+DEFAULT_AGENT = ".claude/agents/orchestrator.md"
+
+
+# Local mode runs the same agent as the GHA workflows and must respect the same
+# turn-budget floor (see ORCHESTRATOR_TURN_FLOOR in scaffold.py). This was 20 —
+# below the floor — because the floor guard only inspected workflow templates,
+# so local mode quietly kept the budget that had already killed two runs.
+# Enforced by tests/unit/test_server.py.
+SESSION_MAX_TURNS = 40
+
+# Hard backstop on continuations. It is deliberately generous, because it is no
+# longer the mechanism that decides when to stop — it exists so a bug in the
+# decision logic cannot loop forever. See _should_continue for the real ladder.
+MAX_CONTINUATIONS = 6
+
+# The per-task ceiling. A turn count measures effort spent, not work completed,
+# which is why raising it never helped: 20 died, 40 died, 60 died, and a single
+# task was observed spending $10.09 across three sessions while making real
+# progress the whole time. Dollars are what an operator actually wants to bound.
+# Env: GENESIS_TASK_COST_CEILING (GENESIS_COST_CEILING still honoured).
+#
+# Raised from 15 to 50 after the first task large enough to trip it. A trust-model
+# change touching five packages ran five sessions and $22.32 without finishing,
+# and each fresh chain pays a re-orientation tax first: it re-reads the branch,
+# the issue and the diff before writing anything new. At 15 a redesign-class task
+# spends much of every chain remembering where it was, so the ceiling stopped
+# bounding waste and started buying it.
+#
+# Note what the ceiling is not: spend is checked *between* sessions, so the
+# session that crosses the line still finishes. $22.32 against a $15 ceiling is
+# the mechanism working, not leaking. It is a tripwire, not a wall.
+#
+# Renamed from COST_CEILING_USD (#46). The bare name read like a budget for the
+# whole run and bounded one continuation chain, which is a different promise.
+TASK_COST_CEILING_USD = 50.0
+
+# The run-scoped budget: every dollar this process launches, across every chain.
+# Env: GENESIS_RUN_COST_BUDGET.
+#
+# The per-task ceiling above cannot bound a run, because a fresh chain starts a
+# fresh accumulator. Measured on MaKlaude (#46): 11 sessions over about 3 hours,
+# 6 success / 4 error_max_turns / 1 error_during_execution, $52.11 cumulative,
+# with the $50 ceiling never firing because no single chain came close. The run
+# stopped only because a human sent SIGTERM. Without this bound the total is
+# unbounded no matter how long the run goes.
+#
+# Default is three task ceilings, so a night can still finish several
+# redesign-class tasks, and a loop that has stopped converging stops at a number
+# an operator can absorb rather than discovering it in a bill.
+#
+# Deliberately NOT persisted across restarts (it is absent from save_state). An
+# operator who restarts `serve` after a budget stop intends a fresh budget; a
+# budget that survived would make the restart silently no-op. Stating the choice
+# because the alternative is defensible and should not be reached by accident.
+RUN_COST_BUDGET_USD = 150.0
+
+# How many times a session may chain straight into another because it changed the
+# repo. Bounded so "work begets work" cannot become a spin: after this many, the
+# loop waits for a real trigger again.
+MAX_FOLLOWUP_CHAIN = 3
+
+# Budget for the judge itself. It reads evidence handed to it and answers with one
+# word, so it needs no tools and almost no turns.
+JUDGE_MAX_TURNS = 2
+
+# Floor for the backstop sweep's window, in hours, and how often the plane runs
+# it. The window itself is derived from the session cap in `_claim_sweep_hours` —
+# it has to stay clear of how long a session can legitimately hold a claim, or the
+# sweep races a healthy run and puts two workers on one issue. Fifteen minutes
+# between sweeps because this is the backstop for a control plane that has
+# already died: nothing about it is urgent, and what it enforces is measured in
+# hours. The primary release is in run_orchestrator, at the ladder's decision.
+CLAIM_SWEEP_MIN_HOURS = 2.0
+CLAIM_SWEEP_INTERVAL_S = 900
+
+# `Write` is required: without it the agent can edit existing files but cannot
+# create any, so any task needing a new file, test, or agent definition is
+# impossible to satisfy.
+ALLOWED_TOOLS = "Read,Write,Edit,Bash,Glob,Grep,Agent"
+
+
+def _now_iso() -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def log(msg: str) -> None:
+    print(f"[{_now_iso()}] {msg}", flush=True)
+
+
+def _gh_token() -> str:
+    result = subprocess.run(
+        ["gh", "auth", "token"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return result.stdout.strip()
+
+
+def _get_repo() -> str:
+    env = os.environ.get("GENESIS_REPO")
+    if env:
+        return env
+    result = subprocess.run(
+        ["gh", "repo", "view", "--json", "nameWithOwner"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return json.loads(result.stdout)["nameWithOwner"]
+
+
+def is_bot_actor(actor_login: str) -> bool:
+    return actor_login.endswith("[bot]") or actor_login == "github-actions"
+
+
+def filter_relevant_events(
+    events: list[dict], last_event_id: str | None
+) -> list[dict]:
+    """Filter raw GitHub events to those that should trigger the orchestrator.
+
+    - Drops bot events (no feedback loops).
+    - Keeps only IssuesEvent / IssueCommentEvent / PullRequestEvent.
+    - Stops at last_event_id (high-water mark).
+    - Returns events in chronological order (oldest first).
+    """
+    new_events = []
+    for event in events:
+        if last_event_id is not None and event.get("id") == last_event_id:
+            break
+        if event.get("type") not in RELEVANT_EVENT_TYPES:
+            continue
+        actor = event.get("actor", {}).get("login", "")
+        if is_bot_actor(actor):
+            continue
+        new_events.append(event)
+    new_events.reverse()
+    return new_events
+
+
+@dataclass
+class PollResult:
+    events: list[dict]
+    etag: str | None
+    not_modified: bool
+
+
+def fetch_events(repo: str, etag: str | None, token: str) -> PollResult:
+    """Fetch repo events. Returns 304 (not_modified=True) when ETag matches.
+
+    Single page (max 100 events). If more than 100 events arrive between polls,
+    older events on subsequent pages are missed. `poll_once` logs a warning when
+    the previous high-water mark isn't visible in the returned page so the user
+    can shorten `--poll-interval`.
+    """
+    req = urllib.request.Request(
+        f"https://api.github.com/repos/{repo}/events?per_page=100",
+        headers={
+            "Accept": "application/vnd.github+json",
+            "Authorization": f"Bearer {token}",
+            "X-GitHub-Api-Version": "2022-11-28",
+            "User-Agent": "genesis-local-control-plane",
+        },
+    )
+    if etag:
+        req.add_header("If-None-Match", etag)
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            new_etag = resp.headers.get("ETag")
+            body = resp.read()
+            events = json.loads(body) if body else []
+            return PollResult(events=events, etag=new_etag, not_modified=False)
+    except urllib.error.HTTPError as e:
+        if e.code == 304:
+            return PollResult(events=[], etag=etag, not_modified=True)
+        raise
+
+
+def _read_text(path: Path) -> str | None:
+    try:
+        return path.read_text().strip()
+    except FileNotFoundError:
+        return None
+
+
+def _write_text(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text)
+
+
+
+def _project_name() -> str:
+    """Project label, matching what log.sh derives, so hook lines and outcome
+    lines land in the same stream namespace and can be joined in one query."""
+    path = Path(".genesis/config.toml")
+    try:
+        for line in path.read_text().splitlines():
+            if line.startswith("name"):
+                return line.split("=", 1)[1].strip().strip('"')
+    except OSError:
+        pass
+    return "unknown"
+
+
+def loki_push(hook_event: str, fields: dict[str, object]) -> bool:
+    """Ship one logfmt line to Loki. Best-effort, never raises.
+
+    Session outcomes — how a run ended, what it cost, how many turns it burned —
+    previously existed only as stdout in whoever's terminal was running `serve`.
+    Close the window and the record was gone, which made the most decision-
+    relevant telemetry the system produces the one thing it could not query.
+
+    Labels stay low-cardinality (project, hook_event, service_name); everything
+    else is a logfmt field, promoted at query time with `| logfmt`.
+    """
+    url = os.environ.get("GENESIS_LOKI_URL", "").strip()
+    if not url:
+        return False
+
+    ns = time.time_ns()
+    stamp = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(ns // 1_000_000_000))
+    ordered = {"ts": f"{stamp}.{ns % 1_000_000_000 // 1_000_000:03d}Z", "event": hook_event}
+    ordered.update({k: v for k, v in fields.items() if v is not None})
+
+    def fmt(value: object) -> str:
+        text = str(value)
+        return json.dumps(text) if any(c in text for c in ' "=\\') else text
+
+    line = " ".join(f"{k}={fmt(v)}" for k, v in ordered.items())
+    project = _project_name()
+    payload = json.dumps(
+        {
+            "streams": [
+                {
+                    "stream": {
+                        "project": project,
+                        "hook_event": hook_event,
+                        "service_name": project,
+                    },
+                    "values": [[str(ns), line]],
+                }
+            ]
+        }
+    ).encode()
+
+    req = urllib.request.Request(
+        f"{url.rstrip('/')}/loki/api/v1/push",
+        data=payload,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    user = os.environ.get("GENESIS_LOKI_USER", "")
+    token = os.environ.get("GENESIS_LOKI_TOKEN", "")
+    if user and token:
+        import base64
+
+        cred = base64.b64encode(f"{user}:{token}".encode()).decode()
+        req.add_header("Authorization", f"Basic {cred}")
+    try:
+        with urllib.request.urlopen(req, timeout=5):
+            return True
+    except Exception:  # noqa: BLE001 - telemetry must never break the run
+        return False
+
+
+def _died_mid_task(subtype: str | None) -> bool:
+    """True for any abnormal session ending, not just an exhausted budget.
+
+    This started as an `error_max_turns` check and that was too narrow. Observed
+    in production: a session died `error_during_execution` at turn 41 with real
+    work uncommitted in the tree, and the chain stopped because the subtype did
+    not match - $6.63 spent and the task left stranded for no better reason than
+    a string comparison.
+
+    Every abnormal ending has the same shape: reasoning in a transcript on disk,
+    work in the tree, nobody continuing it. Whether resuming is *wise* is not this
+    function's business - that is what the evidence ladder in _should_continue is
+    for, and its zero-tool-calls rung already stops a session that fails instantly
+    and repeatedly.
+    """
+    return bool(subtype) and subtype != "success"
+
+
+def _task_cost_ceiling() -> float:
+    """Spend allowed per unit of work before continuations stop, whatever anyone
+    thinks. Env override so an operator can tighten it without editing code.
+
+    GENESIS_COST_CEILING is still read, second, because that is the name every
+    existing operator config uses and silently ignoring it would loosen a bound
+    somebody had deliberately tightened.
+    """
+    for var in ("GENESIS_TASK_COST_CEILING", "GENESIS_COST_CEILING"):
+        raw = os.environ.get(var, "").strip()
+        if raw:
+            try:
+                return float(raw)
+            except ValueError:
+                return TASK_COST_CEILING_USD
+    return TASK_COST_CEILING_USD
+
+
+def _run_cost_budget() -> float:
+    """Total spend allowed across every chain this process launches.
+
+    Read fresh on each check rather than captured at startup, matching
+    _task_cost_ceiling, so an operator can tighten a running loop.
+    """
+    raw = os.environ.get("GENESIS_RUN_COST_BUDGET", "").strip()
+    try:
+        return float(raw) if raw else RUN_COST_BUDGET_USD
+    except ValueError:
+        return RUN_COST_BUDGET_USD
+
+
+def _git(args: list[str]) -> str:
+    """Run a read-only git command, returning "" on any failure."""
+    try:
+        out = subprocess.run(
+            ["git", *args], capture_output=True, text=True, timeout=15, check=False
+        )
+        return out.stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
+
+# Reflog subjects that mean "a commit was created here, locally". A pull writes
+# `pull --ff-only: Fast-forward` and a checkout writes `checkout: moving from ...`,
+# neither of which is work this machine did.
+#
+# `merge` is deliberately absent even though a non-fast-forward merge of a local
+# branch is local work: a pull that has to merge also writes `merge origin/main:
+# ...`, and the two are not distinguishable from the subject alone. Leaving it out
+# costs a judge call on a rare shape; including it would reinstate exactly the
+# false positive this exists to remove.
+LOCAL_COMMIT_REFLOG_PREFIXES = ("commit", "rebase", "cherry-pick")
+
+
+def session_work_marker() -> str:
+    """A cheap hash of the work *this machine* has done, for before/after comparison.
+
+    Still evidence rather than self-report, which is the part that must not change:
+    within one hour we watched a worker report it had not merged a PR it had merged,
+    and an orchestrator conclude that auto-merge had closed an issue a human closed
+    by hand. HEAD and the working tree are facts; a narrative isn't.
+
+    What changed is the question being asked. Hashing `HEAD + git status` answers
+    "did this repository change", and the ladder was reading it as "did this session
+    accomplish something". Those coincide only when the session is the sole writer,
+    and it never is: a human merging a pull request mid-session, auto-merge landing
+    a bot PR, or the session's own opening `git pull` all move HEAD without the
+    session having produced anything. Measured (#47) — a session that ran 38 reads
+    and greps, wrote nothing, pulled somebody else's squash-merge once, and was
+    scored as having landed work.
+
+    Three components, all narrow on purpose:
+
+    - Reflog entries that record a commit being *created here*. A fetched commit
+      never gets one; `git commit` always does, and it survives the subsequent push.
+    - Commits reachable from HEAD but from no remote-tracking ref, so an unpushed
+      commit still counts if the reflog is off (`core.logAllRefUpdates=false`) and
+      a pulled commit still doesn't, since it arrives already reachable from one.
+    - Tracked-file modifications, **excluding untracked files**. A stray temporary
+      file left by a tool is indistinguishable from a new source file by path alone,
+      so untracked-only churn is treated as ambiguous rather than as progress, and
+      the judge — which is handed `git status --porcelain` as evidence — decides.
+
+    The residual gap is a session that commits *and* pushes within one attempt while
+    the reflog is disabled: nothing local remains to point at. That reads as
+    ambiguous and costs one judge call, which is the safe direction. Scoring it as
+    progress is the direction that bills.
+    """
+    return hashlib.sha256(
+        "\n".join(
+            [
+                _local_commit_reflog(),
+                _git(["rev-list", "HEAD", "--not", "--remotes"]),
+                _git(["status", "--porcelain", "--untracked-files=no"]),
+            ]
+        ).encode()
+    ).hexdigest()[:16]
+
+
+def _local_commit_reflog() -> str:
+    """Reflog entries for commits created on this machine, newest first."""
+    entries = _git(["reflog", "show", "HEAD", "--format=%H %gs"])
+    return "\n".join(
+        line
+        for line in entries.splitlines()
+        if line.partition(" ")[2].startswith(LOCAL_COMMIT_REFLOG_PREFIXES)
+    )
+
+
+def _brief(tool_input: object, limit: int = 88) -> str:
+    """Render a tool's input as one short line for the progress feed.
+
+    Prefers the field that says what the call is actually doing — a command, a
+    path, a pattern — and falls back to a truncated repr.
+    """
+    if not isinstance(tool_input, dict):
+        return ""
+    for key in ("command", "file_path", "pattern", "path", "query", "description"):
+        value = tool_input.get(key)
+        if isinstance(value, str) and value.strip():
+            flat = " ".join(value.split())
+            return flat[:limit] + ("…" if len(flat) > limit else "")
+    flat = " ".join(str(tool_input).split())
+    return flat[:limit] + ("…" if len(flat) > limit else "")
+
+
+def _build_prompt(event: dict | None, agent: str = DEFAULT_AGENT) -> str:
+    if event is None:
+        return (
+            f"Run the agent defined in {agent}. "
+            "This is a local control plane initial run - assess project state and advance work."
+        )
+    event_type = event.get("type", "UnknownEvent")
+    action = event.get("payload", {}).get("action", "unknown")
+    actor = event.get("actor", {}).get("login", "unknown")
+    return (
+        f"Run the agent defined in {agent}.\n\n"
+        "An event triggered this run:\n"
+        f"- Event: {event_type} / {action}\n"
+        f"- Actor: {actor}\n\n"
+        "Assess this event in context of the project state and take appropriate action."
+    )
+
+
+@dataclass
+class LocalControlPlane:
+    repo: str
+    poll_interval: int = 60
+    session_timeout: int = 3600
+    agent: str = DEFAULT_AGENT
+    # Written by the progress reader, read by the continuation loop after wait().
+    last_session_id: str | None = None
+    last_result_subtype: str | None = None
+    last_tool_calls: int = 0
+    last_cost: float = 0.0
+    # Every dollar this process has launched, across every chain. The chain-local
+    # `spent` in run_orchestrator resets on each fresh chain by design; this does
+    # not, which is the whole difference between the two bounds (#46).
+    run_spent: float = 0.0
+    # What the last `_should_continue` call spent on judges, folded into both
+    # accumulators by run_orchestrator. Reported rather than self-accumulated so
+    # that the "both accumulators move together, in one place" invariant below
+    # holds for judge sessions too.
+    last_judge_cost: float = 0.0
+    # Set when a judge session's cost could not be read, which makes every figure
+    # downstream a lower bound rather than an exact total. Surfaced at shutdown,
+    # because a bound an operator trusts has to say when it is guessing.
+    cost_is_lower_bound: bool = False
+    recent_tools: list[str] = field(default_factory=list)
+    # Identity every session in the current chain claims work under, minted per
+    # chain rather than per process: chains run one after another, and a token
+    # shared between them would let a chain that died release the claims of an
+    # earlier chain that finished cleanly and is legitimately still holding one.
+    session_token: str = ""
+    last_claim_sweep: float = 0.0
+    pending_followup: bool = False
+    continuation_index: int = 0
+    followup_chain: int = 0
+    identity_logged: bool = False
+    all_workflows: bool = False
+    shutdown: bool = False
+    last_event_id: str | None = None
+    etag: str | None = None
+    orch_proc: subprocess.Popen | None = field(default=None, repr=False)
+
+    # ----- lock -----
+
+    def acquire_lock(self) -> bool:
+        LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
+        if LOCK_PATH.exists():
+            existing = _read_text(LOCK_PATH) or ""
+            try:
+                pid = int(existing)
+                os.kill(pid, 0)
+                return False  # another instance alive
+            except (ValueError, ProcessLookupError, PermissionError):
+                log(f"Stale lock file (pid {existing!r}), removing")
+                LOCK_PATH.unlink(missing_ok=True)
+        LOCK_PATH.write_text(str(os.getpid()))
+        return True
+
+    def release_lock(self) -> None:
+        LOCK_PATH.unlink(missing_ok=True)
+
+    # ----- state persistence -----
+
+    def load_state(self) -> None:
+        self.etag = _read_text(ETAG_PATH)
+        self.last_event_id = _read_text(HIGHWATER_PATH)
+
+    def save_state(self) -> None:
+        if self.etag is not None:
+            _write_text(ETAG_PATH, self.etag)
+        if self.last_event_id is not None:
+            _write_text(HIGHWATER_PATH, self.last_event_id)
+
+    # ----- orchestrator -----
+
+    def _kill_orch(self) -> None:
+        proc = self.orch_proc
+        if proc is None:
+            return
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+        except (ProcessLookupError, PermissionError):
+            try:
+                proc.terminate()
+            except ProcessLookupError:
+                pass
+        try:
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                proc.kill()
+
+    def _stream_progress(self, stream) -> None:
+        """Print one compact line per tool call from claude's stream-json output.
+
+        Best-effort by construction: any parse failure, unexpected shape, or
+        non-iterable stream ends the reader quietly. Progress reporting must
+        never be able to take down the run it is reporting on.
+        """
+        try:
+            turns = 0
+            for raw in stream:  # noqa: PLR1702
+                line = (raw or "").strip()
+                if not line:
+                    continue
+                try:
+                    event = json.loads(line)
+                except ValueError:
+                    continue
+                kind = event.get("type")
+                # Every event carries the session id; the init event is simply the
+                # first. Capturing it is what makes --resume possible at all.
+                session_id = event.get("session_id")
+                if session_id and not self.last_session_id:
+                    self.last_session_id = session_id
+                if kind == "assistant":
+                    content = (event.get("message") or {}).get("content") or []
+                    for block in content:
+                        if not isinstance(block, dict):
+                            continue
+                        if block.get("type") == "tool_use":
+                            turns += 1
+                            summary = f"{block.get('name')} {_brief(block.get('input'))}"
+                            log(f"  {turns:>3}. {summary}")
+                            # Kept for the judge: what it actually did, not what it
+                            # says it did. Bounded so a long session can't grow this
+                            # without limit.
+                            self.recent_tools.append(summary)
+                            del self.recent_tools[:-12]
+                elif kind == "result":
+                    # ONE PROCESS CAN EMIT MORE THAN ONE OF THESE. Measured (#78,
+                    # #79): a leftover task notification from a background job the
+                    # agent had started itself flushed an empty turn and an early
+                    # `result`, the continuation prompt landed 20ms later, and the
+                    # same process carried on and emitted a second `result` 27
+                    # seconds after that. Two result events, one session.
+                    #
+                    # So nothing here may assume it is seeing the last one.
+                    # `last_result_subtype`, `last_tool_calls` and
+                    # `last_session_id` are last-write-wins on purpose, and that is
+                    # correct for all three: the terminal event carries the outcome
+                    # that mattered, and `turns` is cumulative across the stream so
+                    # its final value is the session total. Cost is the one that
+                    # has to accumulate, because each event reports only its own.
+                    self.last_result_subtype = event.get("subtype")
+                    loki_push(
+                        "session-outcome",
+                        {
+                            "level": "error" if event.get("is_error") else "info",
+                            "subtype": event.get("subtype"),
+                            "turns": event.get("num_turns"),
+                            "cost_usd": round(float(event.get("total_cost_usd") or 0), 4),
+                            "duration_s": round((event.get("duration_ms") or 0) / 1000),
+                            "tool_calls": turns,
+                            "session": event.get("session_id"),
+                            "continuation": self.continuation_index,
+                        },
+                    )
+                    self.last_tool_calls = turns
+                    # `+=`, not `=`. `_run_session` zeroes this before launching,
+                    # so accumulating gives the process total. Overwriting charged
+                    # only the final event, which is the same undercount shape as
+                    # the unaccounted judge sessions in issue #50, one layer down.
+                    self.last_cost += float(event.get("total_cost_usd") or 0)
+                    if event.get("session_id"):
+                        self.last_session_id = event["session_id"]
+                    cost = event.get("total_cost_usd") or 0
+                    secs = round((event.get("duration_ms") or 0) / 1000)
+                    log(
+                        f"  session ended: {event.get('subtype')} "
+                        f"turns={event.get('num_turns')} cost=${cost:.2f} {secs}s"
+                    )
+        except Exception:  # noqa: BLE001 - reporting must never break the run
+            return
+
+    def run_orchestrator(
+        self, event: dict | None, prompt: str | None = None, label: str | None = None
+    ) -> int:
+        """Run one unit of work, continuing across budget deaths.
+
+        A session that dies at `error_max_turns` has not failed at the task — it
+        ran out of turns mid-thought, leaving its reasoning in a transcript on
+        disk and its work uncommitted in the tree. Starting over throws away the
+        first, and forces the next session to re-derive intent from the second.
+        `claude --resume` carries both forward with a fresh budget, which is the
+        "batches of N turns" shape rather than one ever-larger ceiling: raising
+        the cap moved the wall (20 died, 40 died, 60 died), it never removed it.
+
+        Bounded three ways, because an unbounded retry loop is a way to spend
+        money in your sleep: a hard continuation cap, an overall deadline shared
+        by every attempt, and a stop as soon as an attempt does nothing at all.
+        """
+        prompt = prompt or _build_prompt(event, self.agent)
+
+        # The run budget is checked HERE, before launching, not only inside
+        # _should_continue. A chain that ends normally exits the ladder without
+        # consulting it, and the next event starts a fresh chain with a fresh
+        # accumulator - which is exactly how $52.11 accrued against a $50 bound.
+        # Setting `shutdown` rather than just returning means the poll loop exits
+        # through _shutdown and re-enables the workflows it disabled, the same
+        # path SIGTERM takes. A budget stop that left GitHub Actions off would be
+        # worse than not stopping.
+        budget = _run_cost_budget()
+        if self.run_spent >= budget:
+            log(f"Run cost budget reached ({self._spend(self.run_spent)} >= ${budget:.2f}) "
+                f"- not launching, shutting down")
+            loki_push(
+                "run-budget-stop",
+                {
+                    "level": "warn",
+                    "run_spent_usd": round(self.run_spent, 4),
+                    "budget_usd": budget,
+                },
+            )
+            self.shutdown = True
+            return 0
+
+        if event is None:
+            # Several paths run without an event: startup, a due trigger, and the
+            # follow-up pass. Labelling them all "initial run" made a mid-session
+            # follow-up read like a restart.
+            log(f"Launching orchestrator ({label or 'initial run'})")
+        else:
+            event_type = event.get("type", "?")
+            action = event.get("payload", {}).get("action", "?")
+            event_id = event.get("id", "?")
+            log(f"Launching orchestrator for {event_type}/{action} (id={event_id})")
+
+        # One deadline for the whole chain, not per attempt — otherwise three
+        # continuations could quietly run for three times the configured timeout.
+        deadline = time.time() + self.session_timeout
+
+        # The identity every session in this chain claims work under. Fresh per
+        # chain, so releasing at the end takes back what this chain claimed and
+        # not what a previous one is still legitimately holding. Random rather
+        # than derived from the pid: two chains a second apart in one process
+        # would otherwise collide, and the collision releases someone else's claim.
+        self.session_token = f"serve-{uuid.uuid4().hex[:12]}"
+
+        task = prompt.splitlines()[0] if prompt else "the current unit of work"
+        self.continuation_index = 0
+        before = session_work_marker()
+        rc = self._run_session(prompt, deadline)
+        # Two accumulators, updated together at every point a session's cost is
+        # final: `spent` is this chain's, `run_spent` is the process's. If you add
+        # a third _run_session call site, it needs both lines.
+        spent = self.last_cost
+        self.run_spent += self.last_cost
+
+        # Why the ladder stopped, in the words the release comment carries. A
+        # human looking at an issue whose `in-progress` label vanished needs to
+        # know which rung took it back; "the claim expired" would tell them
+        # nothing, which is half of why an age-based expiry is the wrong shape.
+        stop_reason = "the session ended without finishing"
+        # Tracked separately from `last_result_subtype` because a broken resume
+        # reports `success` while having finished nothing. Everything downstream
+        # that asks "did this chain end cleanly" has to agree with the ladder, not
+        # with the last subtype it happened to see.
+        finished_cleanly: bool | None = None
+
+        for attempt in range(1, MAX_CONTINUATIONS + 1):
+            if self.shutdown or not _died_mid_task(self.last_result_subtype):
+                if self.shutdown:
+                    stop_reason = "the control plane is shutting down"
+                break
+            session_id = self.last_session_id
+            if not session_id:
+                log("  hit max turns but no session id was reported - cannot resume")
+                stop_reason = "the session died with no id to resume from"
+                break
+            if time.time() > deadline:
+                log("  session deadline reached - not continuing")
+                stop_reason = "the session deadline was reached, so it won't be resumed"
+                break
+
+            go, why = self._should_continue(task, before, spent)
+            # The judge is a real `claude` session and its cost is real. It bypasses
+            # `_run_session`, so nothing else adds it, and it is consulted on the
+            # ambiguous rung a thrashing chain keeps landing on - the accounting was
+            # systematically low exactly where the bounds matter (#50).
+            spent += self.last_judge_cost
+            self.run_spent += self.last_judge_cost
+            loki_push(
+                "continuation-decision",
+                {
+                    "level": "info" if go else "warn",
+                    "decision": "continue" if go else "stop",
+                    "reason": why,
+                    "spent_usd": round(spent, 4),
+                    "judge_cost_usd": round(self.last_judge_cost, 4),
+                    "attempt": attempt,
+                    "session": session_id,
+                },
+            )
+            if not go:
+                log(f"  not continuing: {why}")
+                stop_reason = why
+                break
+
+            log(f"  hit max turns; resuming {session_id[:8]} "
+                f"(continuation {attempt}, ${spent:.2f} spent) - {why}")
+            before = session_work_marker()
+            self.continuation_index = attempt
+            rc = self._run_session(None, deadline, resume=session_id)
+            spent += self.last_cost
+            self.run_spent += self.last_cost
+
+            # A resume that came back instantly, empty and "successful" did not
+            # resume anything. Left alone it ends the chain, because `success` is
+            # not an abnormal ending - so a task with real uncommitted work and
+            # $6.47 already spent gets abandoned on the strength of a session that
+            # never reached the model (#43).
+            #
+            # Retried once rather than given up on, because the observed failure
+            # was transient: a fresh session seconds later picked the same work up
+            # fine. The retry costs nothing by definition - a session that cost
+            # nothing is what got us here - and does not consume a continuation,
+            # since no continuation happened.
+            if self._resume_loaded_nothing():
+                log(f"  resume of {session_id[:8]} loaded nothing - retrying once")
+                rc = self._run_session(None, deadline, resume=session_id)
+                spent += self.last_cost
+                self.run_spent += self.last_cost
+                if self._resume_loaded_nothing():
+                    # Twice is a broken resume, not a blip. Say so and hand the
+                    # work to the follow-up pass explicitly, rather than reporting
+                    # a clean finish and relying on the fingerprint check to
+                    # rescue it by luck - which is how this survived last time.
+                    log("  resume produced an empty session twice - "
+                        "treating the chain as unfinished")
+                    stop_reason = "the session could not be resumed"
+                    finished_cleanly = False
+                    self.pending_followup = True
+                    break
+        else:
+            # Every continuation used and the chain is still unfinished. This is
+            # the one exit that isn't a `break`, so it needs its own reason.
+            stop_reason = f"the continuation cap of {MAX_CONTINUATIONS} was reached"
+
+        # The loop's own output does not wake it: the agent authenticates as the
+        # App, so closing an issue or merging a pull request emits a *bot* event,
+        # which the feedback-loop filter drops. Observed: T1 closed at 06:31 and
+        # nothing happened until a human commented 16 minutes later - otherwise it
+        # would have idled until the six-hour cron. CI does not have this problem
+        # because genesis-merge.yml ends by dispatching the orchestrator; this is
+        # that dispatch.
+        if (
+            not self.shutdown
+            and session_work_marker() != before
+            and self.followup_chain < MAX_FOLLOWUP_CHAIN
+        ):
+            self.followup_chain += 1
+            self.pending_followup = True
+            log(f"  this session changed the repo; queueing a follow-up pass "
+                f"({self.followup_chain}/{MAX_FOLLOWUP_CHAIN})")
+
+        if _died_mid_task(self.last_result_subtype):
+            # The work is real and uncommitted, and nothing else is scheduled to
+            # touch it. Without this flag the plane would sit idle holding a
+            # half-finished task until some unrelated repo event happened along.
+            self.pending_followup = True
+            log(f"  still incomplete (${spent:.2f} spent) - will pick it up on the next tick")
+
+        # Anything but a clean finish hands the claims back, which is deliberately
+        # wider than the resume predicate above: a session killed outright — the
+        # deadline, SIGKILL, a CLI that dies before emitting a result — reports no
+        # subtype at all, so `_died_mid_task` reads False and the ladder is never
+        # even entered. Nothing is going to resume that either, and what it
+        # claimed is held by nobody.
+        #
+        # This runs before the follow-up pass rather than after, because that pass
+        # is a *fresh* session with none of this chain's context: it re-selects
+        # work through `issues.sh next`, and `next` skips anything still labelled
+        # `in-progress`. A claim left on would make the follow-up walk past the
+        # very task it was queued to rescue, which is what MaKlaude issue #195
+        # measured.
+        if finished_cleanly is None:
+            finished_cleanly = self.last_result_subtype == "success"
+        if not finished_cleanly:
+            self.release_claims(stop_reason)
+
+        # Outside a chain the plane holds no claims, and a sweeper that still
+        # names a finished chain would exempt that chain's claims from the
+        # backstop it no longer has any business protecting.
+        self.session_token = ""
+        return rc
+
+    def run_due_triggers(self, token: str) -> None:
+        """Fire the workflow triggers that have no event to hang off.
+
+        A cron has no event at all and a `workflow_run` conclusion is not in the
+        repo events feed, so the two schedules and CI-failure triage have to be
+        polled. Only one fires per tick: these launch full sessions, and stacking
+        three of them because a laptop was closed overnight would be a surprising
+        way to spend an afternoon's budget.
+        """
+        state = triggers.load_state()
+        now = time.time()
+
+        runs = triggers.failed_runs(self.repo, state.get("ci_failure_seen"), token)
+        due = (
+            triggers.ci_failure_due(runs)
+            or triggers.scheduled_due(state, now)
+            or triggers.evolver_due(state, now, Path(".claude/agents/evolver.md").is_file())
+        )
+        if due is None:
+            return
+
+        log(f"Trigger due: {due.name}")
+        previous_agent = self.agent
+        self.agent = due.agent
+        try:
+            self.run_orchestrator(None, prompt=due.prompt, label=f"{due.name} trigger")
+        finally:
+            self.agent = previous_agent
+
+        if due.name == "ci-failure" and runs:
+            state["ci_failure_seen"] = runs[-1].get("createdAt")
+        else:
+            state[due.name] = now
+        triggers.save_state(state)
+
+    def merge_ready_prs(self) -> list[int]:
+        """Land any bot pull request whose checks are all green.
+
+        Deterministic on purpose. The rule is a predicate, not a judgement, and a
+        merge step that cannot exhaust a turn budget is one less way for the loop
+        to stall. Merging as the App keeps the attribution honest and keeps the
+        "only merge bot PRs" rule meaningful.
+        """
+        if os.environ.get("GENESIS_AUTO_MERGE", "on").strip().lower() == "off":
+            return []
+        token = mint_installation_token(self.repo)
+        try:
+            return merge_ready(self.repo, token, log=log)
+        except Exception as e:  # noqa: BLE001 - a merge sweep must never kill the plane
+            log(f"  merge sweep failed: {e}")
+            return []
+
+    def _session_env(self) -> dict[str, str]:
+        """Environment for a child `claude` process.
+
+        One helper for both the agent and the judge, because the two used to
+        build this separately and drifted: an edit meant for the agent landed in
+        the judge, so the judge authenticated as the App while the agent it was
+        judging still ran as the operator.
+        """
+        env = dict(os.environ)
+
+        # Act as the GitHub App, like the Actions path does, so the agent is a
+        # distinguishable identity rather than a second copy of the operator.
+        # Minted per session: installation tokens last an hour and a plane that
+        # runs all afternoon would otherwise hold a dead one.
+        app_token = mint_installation_token(self.repo, env)
+
+        # The App private key is far stronger than the hour-long token minted
+        # from it - it can mint tokens for every repo the App is installed on, at
+        # any time. The plane needs it, a session never does.
+        for secret in ("GENESIS_GITHUB_APP_SECRET", "GENESIS_GITHUB_APP_ID"):
+            env.pop(secret, None)
+
+        if app_token:
+            env["GH_TOKEN"] = app_token
+            env["GITHUB_TOKEN"] = app_token
+            if not self.identity_logged:
+                log("  agent authenticates as the Genesis App, not your account")
+                self.identity_logged = True
+        elif not self.identity_logged:
+            log("  agent uses your personal gh credential - its commits will look like yours")
+            self.identity_logged = True
+
+        # What the session claims work under. `issues.sh claim` writes it into a
+        # marker comment on the issue, which is the only reason a claim can later
+        # be matched back to the chain that made it - the `in-progress` label
+        # carries no identity at all.
+        env["GENESIS_SESSION"] = self.session_token
+        return env
+
+    # ----- claims -----
+
+    def _run_issues_script(self, args: list[str]) -> None:
+        """Run one deterministic `issues.sh` subcommand, echoing what it did.
+
+        As the App, through `_session_env`, because the App is who wrote the label
+        being taken back - a release attributed to the operator would make the
+        board's history read as though a human intervened.
+
+        Never raises. Claim bookkeeping runs on the path where a session has
+        already failed, and turning a failed release into a crashed control plane
+        would trade a stuck label for a stopped dev system.
+        """
+        if not ISSUES_SCRIPT.is_file():
+            return
+        try:
+            out = subprocess.run(
+                ["bash", str(ISSUES_SCRIPT), *args],
+                capture_output=True,
+                text=True,
+                timeout=120,
+                check=False,
+                env=self._session_env(),
+            )
+        except (OSError, subprocess.SubprocessError) as e:
+            log(f"  {args[0]} failed to run: {e}")
+            return
+        for line in (out.stdout or "").splitlines():
+            if line.strip():
+                log(f"  {line.strip()}")
+        if out.returncode != 0:
+            log(f"  {args[0]} exited {out.returncode}: {(out.stderr or '').strip()[:200]}")
+
+    def _resume_loaded_nothing(self) -> bool:
+        """True when a resume came back as an instant, empty, "successful" session.
+
+        Measured (#43): `session ended: success turns=0 cost=$0.00 0s`, six seconds
+        after the ladder decided to continue a chain that had just spent $6.47.
+        `_died_mid_task` sees `success` and ends the chain, so the work stranded -
+        the exact shape continuations exist to prevent. It only survived because
+        the follow-up pass happened to launch a fresh session seconds later.
+
+        Zero tools *and* zero cost is what separates this from a real short
+        session. A session that genuinely had nothing left to do still pays for
+        the turn in which it decides that; one that cost nothing never reached the
+        model, which means the transcript it was told to resume never loaded.
+        """
+        return (
+            self.last_result_subtype == "success"
+            and self.last_tool_calls == 0
+            and self.last_cost == 0.0
+        )
+
+    def _pre_session_hook_is_declared(self) -> bool:
+        """True when .claude/settings.json already runs the script on SessionStart.
+
+        Reads defensively and answers False on anything it can't parse: the cost of
+        a wrong False is running a net twice, and the cost of a wrong True is not
+        running it at all. Those don't weigh the same.
+        """
+        try:
+            settings = json.loads(CLAUDE_SETTINGS.read_text())
+            entries = (settings.get("hooks") or {}).get("SessionStart") or []
+            return any(
+                PRE_SESSION_SCRIPT.name in (hook.get("command") or "")
+                for entry in entries
+                for hook in (entry.get("hooks") or [])
+            )
+        except (OSError, ValueError, AttributeError, TypeError):
+            return False
+
+    def run_pre_session_steps(self) -> None:
+        """Run the dev repo's own pre-agent checks, the way a workflow step would.
+
+        A dev system is taught to make a deterministic check a script and put it
+        ahead of the agent step in workflow YAML. `serve` disables every workflow,
+        so under local mode that step silently stops existing and the check goes
+        back to being an agent's judgement call - which is the thing it was
+        written to replace. The property worth holding is that a net a dev system
+        built to be deterministic stays deterministic across execution modes,
+        otherwise "we made this a script so nobody has to remember it" is only
+        true in CI.
+
+        Bounded and non-fatal: this runs before a session, and a net that hangs or
+        fails must not be able to stop the loop it protects. Output is echoed so
+        the terminal shows what ran, which is the local equivalent of a step's log.
+
+        Skipped when the script is already declared on `SessionStart`, which is how
+        genesis seeds it. That hook is the seam both execution modes share - it
+        fires under GitHub Actions and under serve alike - so it's the mechanism,
+        and this call is the fallback for a repo that has unwired it. Running both
+        would run every net twice a session, and "idempotent" is a contract the
+        control plane shouldn't lean on when it can simply not do it twice.
+        """
+        if not PRE_SESSION_SCRIPT.is_file():
+            return
+        if self._pre_session_hook_is_declared():
+            return
+        try:
+            out = subprocess.run(
+                ["bash", str(PRE_SESSION_SCRIPT)],
+                capture_output=True,
+                text=True,
+                timeout=PRE_SESSION_TIMEOUT_S,
+                check=False,
+                env=self._session_env(),
+            )
+        except subprocess.TimeoutExpired:
+            log(f"  pre-session.sh exceeded {PRE_SESSION_TIMEOUT_S}s - continuing without it")
+            return
+        except (OSError, subprocess.SubprocessError) as e:
+            log(f"  pre-session.sh failed to run: {e} - continuing without it")
+            return
+        for line in (out.stdout or "").splitlines():
+            if line.strip():
+                log(f"  pre-session: {line.strip()}")
+        if out.returncode != 0:
+            log(
+                f"  pre-session.sh exited {out.returncode} - continuing anyway: "
+                f"{(out.stderr or '').strip()[:200]}"
+            )
+
+    def release_claims(self, reason: str) -> None:
+        """Give back the issues this chain claimed, now that nothing will finish them.
+
+        The release keys on the ladder's not-continuing decision rather than on
+        how old a claim is, and that choice is the whole design. `in-progress`
+        looks identical whether a live session applied it four seconds ago or a
+        killed one applied it an hour ago, so any age-based expiry races a slow
+        but healthy session and hands its issue to a second worker - two branches
+        and a merge conflict, neither run aware of the other. The ladder, by
+        contrast, knows both that the session is over and that nobody will resume
+        it, which is liveness rather than a guess at liveness.
+
+        Measured (#48, from MaKlaude issue #195): claimed 02:18, quiet 03:17,
+        killed by the session deadline 03:33, `session deadline reached - not
+        continuing` at 03:33:30 - and the label still sat there. Clean tree, no
+        branch, no commit, no pull request, so no part of the task was under way,
+        yet `next --milestone 6` skipped the issue and picked something else until
+        a human removed the label by hand.
+
+        A chain that IS resumed keeps its claims: this runs once, when the chain
+        ends, so every continuation in between is still the same worker holding
+        the same issue. A chain that ends in success keeps them too - it may have
+        left a pull request open and the claim still describes reality; the sweep
+        is what covers that if it turns out it doesn't.
+        """
+        if not self.session_token:
+            return
+        self._run_issues_script(
+            ["release", "--session", self.session_token, "--reason", reason]
+        )
+
+    def _claim_sweep_hours(self) -> float:
+        """How stale a claim must be before the backstop takes it back.
+
+        Twice the session cap, because a chain may legitimately hold a claim for
+        the whole of it - the deadline covers every continuation, not each one -
+        and a window inside that range would release live work. Doubling leaves
+        room for the clock skew between whichever host made the claim and this
+        one, since the age comes from GitHub's own comment timestamp.
+        """
+        return max(CLAIM_SWEEP_MIN_HOURS, 2 * self.session_timeout / 3600)
+
+    def sweep_stale_claims(self, force: bool = False) -> None:
+        """Release claims whose session can't be accounted for by anyone.
+
+        Strictly a backstop for the case `release_claims` structurally cannot
+        reach: a control plane that is SIGKILLed, or a GitHub Actions run the
+        runner cancels, decides nothing and therefore releases nothing. Age is
+        the only evidence available about somebody else's dead process, which is
+        exactly why this is the second layer and not the first.
+        """
+        now = time.time()
+        if not force and now - self.last_claim_sweep < CLAIM_SWEEP_INTERVAL_S:
+            return
+        self.last_claim_sweep = now
+        self._run_issues_script(
+            ["sweep-claims", "--older-than", f"{self._claim_sweep_hours():g}"]
+        )
+
+    def _spend(self, amount: float) -> str:
+        """Format a running total, saying so when it is known to be incomplete.
+
+        A bound is only worth what an operator's trust in it is worth, so a total
+        that has lost a judge session's cost has to read differently from one that
+        hasn't. "$52.11" and "at least $52.11" lead to different decisions.
+        """
+        return f"{'at least ' if self.cost_is_lower_bound else ''}${amount:.2f}"
+
+    def _read_judge_output(self, stdout: str | None) -> tuple[str, float]:
+        """Pull the judge's one-word verdict and its cost out of `--output-format json`.
+
+        Falls back to reading the payload as prose. That fallback is not defensive
+        padding: a judge that stops parsing is a judge that always fails closed,
+        which silently converts every ambiguous continuation into a stop and idles
+        the dev system. Losing the cost figure is the smaller harm, so an
+        unreadable envelope costs accuracy, not the verdict - and it sets
+        `cost_is_lower_bound` so the totals stop claiming to be exact (#50).
+        """
+        text = (stdout or "").strip()
+        if not text:
+            return "", 0.0
+        try:
+            payload = json.loads(text)
+        except ValueError:
+            payload = None
+        if not isinstance(payload, dict) or "result" not in payload:
+            self.cost_is_lower_bound = True
+            log("  WARNING: judge output was not the expected JSON envelope - "
+                "its cost is unaccounted, so the totals below are a lower bound")
+            return text, 0.0
+        return str(payload.get("result") or "").strip(), float(payload.get("total_cost_usd") or 0)
+
+    def ask_judge(self, task: str) -> tuple[bool, str]:
+        """Ask a fresh session whether a stalled run deserves another continuation.
+
+        Separate session, no shared context, and it is handed evidence rather than
+        the previous session's summary. It is framed to justify *stopping*: a judge
+        asked "may this continue?" tends to say yes, and the expensive mistake here
+        is continuing, not halting.
+
+        Fails closed. Any error, timeout, or unrecognised answer stops the chain,
+        because the failure mode of a broken judge should be an idle dev system,
+        not an open-ended spend.
+        """
+        self.last_judge_cost = 0.0
+        evidence = "\n".join(
+            [
+                f"Task: {task}",
+                "",
+                "Uncommitted changes (git status --porcelain):",
+                _git(["status", "--porcelain"]) or "(none)",
+                "",
+                "Diff stat (git diff --stat):",
+                _git(["diff", "--stat"]) or "(none)",
+                "",
+                "Recent commits:",
+                _git(["log", "--oneline", "-3"]) or "(none)",
+                "",
+                "What the last session actually did, most recent last:",
+                "\n".join(f"  - {t}" for t in self.recent_tools) or "  (nothing)",
+            ]
+        )
+        prompt = (
+            "You are judging whether an autonomous coding session that ran out of "
+            "turns should be given another one. It has already been resumed at "
+            "least once.\n\n"
+            "Default to STOP. Answer CONTINUE only if the evidence shows the "
+            "session converging on a finish — edits narrowing toward a specific "
+            "goal, tests being fixed, a diff that is coherent and nearly done. "
+            "Answer STOP if it looks like it is thrashing: re-reading the same "
+            "files, re-editing the same lines, broadening scope, or producing no "
+            "durable change.\n\n"
+            f"{evidence}\n\n"
+            "Reply with exactly one word, CONTINUE or STOP, then a single short "
+            "sentence of justification on the same line."
+        )
+
+        cmd = [
+            "claude",
+            "-p",
+            prompt,
+            "--max-turns",
+            str(JUDGE_MAX_TURNS),
+            "--allowedTools",
+            "",
+            # Asked for so the judge's own spend can be read back. Without it
+            # `claude -p` prints bare prose, nothing carries `total_cost_usd`, and
+            # both bounds undercount by one judge session per continuation
+            # decision (#50) - precisely on the ambiguous rung a thrashing chain
+            # keeps landing on, so the calls cluster where spend already matters.
+            "--output-format",
+            "json",
+        ]
+        child_env = self._session_env()
+        try:
+            out = subprocess.run(
+                cmd, capture_output=True, text=True, timeout=180, env=child_env, check=False
+            )
+        except (OSError, subprocess.SubprocessError) as e:
+            return False, f"judge unavailable ({e})"
+
+        answer, self.last_judge_cost = self._read_judge_output(out.stdout)
+        head = answer.upper()[:40]
+        if head.startswith("CONTINUE"):
+            return True, answer.splitlines()[0][:160]
+        if head.startswith("STOP"):
+            return False, answer.splitlines()[0][:160]
+        return False, f"judge gave no clear verdict: {answer.splitlines()[0][:120] if answer else '(empty)'}"
+
+    def _should_continue(
+        self, task: str, before: str, spent: float
+    ) -> tuple[bool, str]:
+        """Decide whether to resume, cheapest evidence first.
+
+        A model is only consulted for the genuinely ambiguous case — work was done
+        but nothing landed — because every other rung is answerable by git or by a
+        counter, and paying for an opinion you can compute is waste.
+        """
+        # Zeroed here, not only in ask_judge: most rungs answer without paying for
+        # a judge at all, and a stale figure from the previous decision would be
+        # charged again by the caller.
+        self.last_judge_cost = 0.0
+        # The wider bound is checked first, and each message names WHICH bound
+        # fired. "cost ceiling reached" said neither which one nor what it was the
+        # ceiling of, so a reader could not tell a task tripwire from a run stop.
+        budget = _run_cost_budget()
+        if self.run_spent >= budget:
+            return False, f"run cost budget reached ({self._spend(self.run_spent)} >= ${budget:.2f})"
+        ceiling = _task_cost_ceiling()
+        if spent >= ceiling:
+            return False, f"task cost ceiling reached (${spent:.2f} >= ${ceiling:.2f})"
+        if self.last_tool_calls == 0:
+            return False, "the attempt made no tool calls"
+        if session_work_marker() != before:
+            return True, "this session changed the repo"
+        return self.ask_judge(task)
+
+    def _run_session(
+        self, prompt: str | None, deadline: float, resume: str | None = None
+    ) -> int:
+        """Launch one `claude -p` session and wait for it, streaming progress."""
+        # Before the agent gets its first turn, which is the whole point of the
+        # step this stands in for. A resumed session gets it too: the workflow
+        # equivalent runs once per run, and a resume is a run.
+        self.run_pre_session_steps()
+
+        self.last_result_subtype = None
+        self.last_tool_calls = 0
+        self.last_cost = 0.0
+
+        cmd = ["claude", "-p"]
+        if resume:
+            cmd += [
+                "--resume",
+                resume,
+                # A resumed session already holds the task, the plan, and what it
+                # has done. Restating the original prompt would invite it to start
+                # the work over rather than finish it.
+                "Continue the work you were doing. You ran out of turns, not out of task.",
+            ]
+        else:
+            cmd.append(prompt or "")
+        cmd += [
+            "--max-turns",
+            str(SESSION_MAX_TURNS),
+            "--allowedTools",
+            ALLOWED_TOOLS,
+            # Without this, `claude -p` buffers everything until the session ends,
+            # so a 25-minute run prints nothing at all — and hook stderr doesn't
+            # help, because Claude Code captures it into its own transcript rather
+            # than passing it through. Streaming turns a silent box into a feed.
+            "--output-format",
+            "stream-json",
+            "--verbose",
+        ]
+        child_env = self._session_env()
+
+        try:
+            self.orch_proc = subprocess.Popen(
+                cmd,
+                start_new_session=True,
+                stdout=subprocess.PIPE,
+                text=True,
+                bufsize=1,
+                env=child_env,
+            )
+        except FileNotFoundError:
+            log("Error: 'claude' command not found. Install Claude Code and ensure it's on PATH.")
+            return 127
+
+        # A piped stdout MUST be drained or the child blocks once the pipe fills.
+        # Daemon thread so a wedged reader can never hold up shutdown.
+        reader = threading.Thread(
+            target=self._stream_progress, args=(self.orch_proc.stdout,), daemon=True
+        )
+        reader.start()
+
+        try:
+            while True:
+                try:
+                    return self.orch_proc.wait(timeout=1)
+                except subprocess.TimeoutExpired:
+                    if self.shutdown:
+                        log("Shutdown requested - terminating orchestrator")
+                        self._kill_orch()
+                        return -2
+                    if time.time() > deadline:
+                        log(f"Session timeout ({self.session_timeout}s total) - terminating orchestrator")
+                        self._kill_orch()
+                        return -1
+        finally:
+            # The process exiting does not mean its output has been parsed. Without
+            # this join the continuation loop can read last_result_subtype before
+            # the reader has seen the terminal `result` event, and a budget death
+            # looks like a clean finish. Bounded so a wedged reader can't hang the
+            # plane — the progress feed is never allowed to block the run.
+            reader.join(timeout=10)
+            self.orch_proc = None
+            self._warn_if_the_session_did_nothing()
+
+    def _warn_if_the_session_did_nothing(self) -> None:
+        """Flag a session that reported success without doing anything.
+
+        Seen for real: fifteen such runs in a row reported success for $0.00 while
+        quietly consuming the event backlog, which is the failure this whole system
+        exists to notice.
+
+        Checked here, after the reader has joined, rather than inside the result
+        branch. A process can emit more than one `result` event, and the per-event
+        version fired on the first one - so a session that flushed an early empty
+        result and then worked normally got told to go and check its API key
+        (#79). By this point `last_tool_calls` and `last_result_subtype` describe
+        the session rather than a moment in it.
+
+        Note the message is about what to check, not about what happened. An
+        earlier version named a mechanism that had been deleted, which cost its
+        reader the whole search before they worked out the advice was stale.
+        """
+        if self.last_tool_calls == 0 and self.last_result_subtype == "success":
+            log(
+                "  WARNING: session ran no tools at all and reported success - "
+                "`claude -p` either could not authenticate (check "
+                "ANTHROPIC_API_KEY) or, on a resume, failed to load the session "
+                "it was given"
+            )
+
+    # ----- main loop -----
+
+    def _interruptible_sleep(self, seconds: float) -> None:
+        deadline = time.time() + seconds
+        while not self.shutdown and time.time() < deadline:
+            remaining = deadline - time.time()
+            time.sleep(min(0.5, max(0.0, remaining)))
+
+    def poll_once(self, token: str) -> list[dict]:
+        result = fetch_events(self.repo, self.etag, token)
+        if result.not_modified:
+            return []
+        if result.etag:
+            self.etag = result.etag
+        events = result.events
+        if not events:
+            return []
+        # If the previous high-water mark is set but isn't on this page, more
+        # than 100 events arrived since the last poll and older ones may have
+        # been pushed to page 2+. We don't paginate (ETag invariant), but warn.
+        if (
+            self.last_event_id is not None
+            and not any(e.get("id") == self.last_event_id for e in events)
+        ):
+            log(
+                f"Warning: previous high-water event id={self.last_event_id} "
+                "not found on returned page; some events may have been missed. "
+                "Consider lowering --poll-interval."
+            )
+        new_events = filter_relevant_events(events, self.last_event_id)
+        # Always advance high-water to newest event seen, even if filtered out
+        self.last_event_id = events[0].get("id")
+        return new_events
+
+    def _prime_high_water_if_needed(self, token: str) -> None:
+        """Record the current newest event id as the high-water mark.
+
+        Avoids replaying every relevant historical event on the events page
+        after the initial orchestrator run. No-op if state was loaded from a
+        prior session.
+        """
+        if self.last_event_id is not None:
+            return
+        try:
+            result = fetch_events(self.repo, etag=None, token=token)
+        except (urllib.error.HTTPError, urllib.error.URLError) as e:
+            log(f"Failed to prime high-water mark ({e}); proceeding without")
+            return
+        if result.events:
+            self.last_event_id = result.events[0].get("id")
+            log(f"Primed high-water mark at event id={self.last_event_id}")
+        if result.etag:
+            self.etag = result.etag
+        self.save_state()
+
+    def serve(self) -> int:
+        log(f"Genesis local control plane starting (repo: {self.repo})")
+        log(
+            f"  poll_interval={self.poll_interval}s session_timeout={self.session_timeout}s"
+        )
+
+        if not self.acquire_lock():
+            log("Another local control plane instance is running. Exiting.")
+            return 1
+
+        # Verify claude is on PATH before disabling workflows. Otherwise we'd
+        # leave GHA off with no working orchestrator running.
+        if shutil.which("claude") is None:
+            log("Error: 'claude' command not found. Install Claude Code and ensure it's on PATH.")
+            self.release_lock()
+            return 127
+
+        # Self-heal: if a prior serve session exited non-gracefully (SIGKILL,
+        # crash, supervisor restart), `.disabled-by-genesis` is on disk and
+        # workflows are still disabled. Re-enable them first so this session
+        # starts from a known clean state; the subsequent disable_workflows
+        # below will disable them again under fresh tracking.
+        if DISABLED_LIST_PATH.exists():
+            try:
+                already_off = tracked_all_disabled(repo=self.repo)
+            except subprocess.CalledProcessError as e:
+                log(f"Could not read workflow state ({e}); assuming reconcile is needed")
+                already_off = False
+
+            if already_off:
+                # Nothing to heal: the end state we want is the state we're in.
+                # Enabling here only to disable again seconds later would re-arm
+                # GHA long enough for a queued event or cron tick to start the
+                # duplicate run this whole mechanism exists to prevent.
+                log(
+                    f"Found {DISABLED_LIST_PATH} from a prior session; tracked "
+                    "workflows are still disabled - keeping them off"
+                )
+            else:
+                log(
+                    f"Found stale {DISABLED_LIST_PATH} from a prior session with "
+                    "workflows re-enabled — reconciling before disabling again"
+                )
+                try:
+                    enable_workflows(repo=self.repo)
+                except subprocess.CalledProcessError as e:
+                    log(
+                        f"Self-heal failed ({e}). Run `genesis workflows enable` "
+                        "manually, then re-run `genesis serve`."
+                    )
+                    self.release_lock()
+                    return 1
+
+        try:
+            disable_workflows(repo=self.repo, genesis_only=not self.all_workflows)
+        except subprocess.CalledProcessError as e:
+            log(f"Failed to disable workflows: {e}")
+            # disable_workflows persists incrementally, so any partial-disable
+            # state is on disk and can be recovered with `genesis workflows enable`.
+            self.release_lock()
+            return 1
+
+        self.load_state()
+
+        try:
+            token = _gh_token()
+        except subprocess.CalledProcessError:
+            log("Failed to read gh auth token. Run `gh auth login` first.")
+            self._reenable_workflows_safe()
+            self.release_lock()
+            return 1
+
+        # Prime high-water mark on first run so the post-initial poll doesn't
+        # replay every relevant historical event on the events page.
+        self._prime_high_water_if_needed(token)
+
+        # Before the first session picks anything, not after. The plane most
+        # likely to be holding an unreleasable claim is the one that died without
+        # deciding anything, and this process is frequently its replacement - so
+        # the board wants clearing while nothing is running on it.
+        self.sweep_stale_claims(force=True)
+
+        # Initial run. If it fails because claude is broken (rc=127), abort
+        # rather than entering the poll loop with workflows off.
+        rc = self.run_orchestrator(None)
+        self.save_state()
+        if rc == 127:
+            log("Initial orchestrator run failed (claude not callable). Aborting.")
+            return self._shutdown(token_ok=True)
+        if self.shutdown:
+            return self._shutdown(token_ok=True)
+
+        log(f"Polling {self.repo} for events...")
+        while not self.shutdown:
+            self._interruptible_sleep(self.poll_interval)
+            if self.shutdown:
+                break
+            try:
+                new_events = self.poll_once(token)
+            except urllib.error.HTTPError as e:
+                if e.code == 401:
+                    log("GitHub auth failed (401). Re-run `gh auth login`.")
+                    break
+                log(f"GitHub API error: HTTP {e.code} {e.reason}")
+                continue
+            except urllib.error.URLError as e:
+                log(f"Network error polling events: {e}")
+                continue
+
+            # genesis-merge.yml's job. A pull request going green is not an event
+            # this poller can see, and the agent's own pull requests are bot-
+            # authored so they are filtered out too. Without this sweep the local
+            # loop can open work it is structurally unable to land.
+            if self.merge_ready_prs():
+                self.pending_followup = True
+
+            # The claims this plane can't see the end of: a GitHub Actions run
+            # cancelled mid-flight, or a sibling process killed. Self-throttled,
+            # because it enforces a window measured in hours and the poll loop
+            # ticks every minute.
+            self.sweep_stale_claims()
+
+            # genesis-ci-failure.yml's job. A workflow_run conclusion is not in the
+            # repo events feed either, so a red check is invisible to local mode
+            # until a human notices.
+            if not new_events and not self.shutdown:
+                self.run_due_triggers(token)
+
+            for event in new_events:
+                if self.shutdown:
+                    break
+                self.followup_chain = 0
+                self.run_orchestrator(event)
+                self.save_state()
+
+            # A run that stopped mid-task left work in the tree that no future
+            # event references. Pick it up on the next tick rather than waiting
+            # for unrelated repo activity to happen along.
+            if self.pending_followup and not new_events and not self.shutdown:
+                self.pending_followup = False
+                self.run_orchestrator(None, label="follow-up pass, work from the previous run is unfinished")
+                self.save_state()
+
+        return self._shutdown(token_ok=True)
+
+    def _shutdown(self, token_ok: bool) -> int:
+        log("Shutting down - re-enabling GitHub Actions workflows")
+        self._reenable_workflows_safe()
+        self.release_lock()
+        self._log_run_total()
+        log("Goodbye.")
+        return 0
+
+    def _log_run_total(self) -> None:
+        """Say what the run cost, on the way out.
+
+        The plane bounds spending three ways - a per-task ceiling, a per-run
+        budget, and the judge accounting from issue #50 - and until this existed it
+        never once reported the resulting number unless a bound was *reached*.
+        Every normal run ended on `Goodbye.` with no figure, so getting the total
+        meant summing the per-session lines out of the log by hand. Measured on a
+        30-minute run that came within $1.17 of its budget and said so nowhere
+        (#77).
+
+        Reported through `_spend`, so it inherits the `at least $X` hedge when a
+        judge session's cost could not be read. This runs on every path that
+        reaches `_shutdown`, which is all three of them: the normal loop exit, a
+        budget stop, and the abort when `claude` is not callable. The last of those
+        is why the zero case still prints rather than being skipped as noise - a
+        run that spent nothing because it never started is worth distinguishing
+        from a run that spent nothing because it had nothing to do.
+        """
+        budget = _run_cost_budget()
+        headroom = budget - self.run_spent
+        note = ""
+        # Worth flagging the near miss. A run that stops early because the next one
+        # would cross the budget looks identical to a run that finished its work,
+        # and the operator only finds out by noticing the absence of progress.
+        if 0 < headroom <= budget * 0.1:
+            note = f" - within ${headroom:.2f} of the ${budget:.2f} budget"
+        log(f"Run total: {self._spend(self.run_spent)} of ${budget:.2f}{note}")
+
+    def _reenable_workflows_safe(self) -> None:
+        try:
+            enable_workflows(repo=self.repo)
+        except subprocess.CalledProcessError as e:
+            log(f"Failed to re-enable workflows: {e}. Run `genesis workflows enable` to retry.")
+
+
+def _make_signal_handler(plane: LocalControlPlane):
+    def handler(signum, frame):
+        log(f"Received signal {signum} - initiating graceful shutdown")
+        plane.shutdown = True
+        # If orchestrator is running, kill it; the main loop will exit when wait() returns.
+        if plane.orch_proc is not None:
+            try:
+                os.killpg(os.getpgid(plane.orch_proc.pid), signal.SIGTERM)
+            except (ProcessLookupError, PermissionError):
+                pass
+
+    return handler
+
+
+def serve() -> int:
+    """Run the local orchestrator server. Entry point for `genesis serve`."""
+    poll_interval = int(os.environ.get("GENESIS_POLL_INTERVAL", "60"))
+    session_timeout = int(os.environ.get("GENESIS_SESSION_TIMEOUT", "3600"))
+    agent = os.environ.get("GENESIS_AGENT", DEFAULT_AGENT)
+    all_workflows = os.environ.get("GENESIS_ALL_WORKFLOWS") == "1"
+
+    # Fail before disabling any workflows: a missing agent definition means every
+    # session would ask Claude to run a file that isn't there.
+    if not Path(agent).is_file():
+        log(f"Error: agent definition not found: {agent}")
+        log("Pass --agent <path> or set GENESIS_AGENT to an existing definition.")
+        return 1
+
+    try:
+        repo = _get_repo()
+    except subprocess.CalledProcessError as e:
+        log(f"Failed to detect repository: {e}")
+        log("Set GENESIS_REPO=owner/repo, or run inside a git repo with a GitHub remote.")
+        return 1
+
+    plane = LocalControlPlane(
+        repo=repo,
+        poll_interval=poll_interval,
+        session_timeout=session_timeout,
+        agent=agent,
+        all_workflows=all_workflows,
+    )
+
+    handler = _make_signal_handler(plane)
+    signal.signal(signal.SIGINT, handler)
+    signal.signal(signal.SIGTERM, handler)
+    # SIGHUP too: closing the terminal window is the most common way this process
+    # dies, and unhandled it skips cleanup entirely — leaving the repo's
+    # workflows disabled and a stale tracking file behind. SIGKILL still can't be
+    # caught; `genesis workflows enable` is the recovery hatch for that.
+    signal.signal(signal.SIGHUP, handler)
+
+    try:
+        return plane.serve()
+    except Exception as e:
+        log(f"Unexpected error: {e}")
+        plane._reenable_workflows_safe()
+        plane.release_lock()
+        return 1

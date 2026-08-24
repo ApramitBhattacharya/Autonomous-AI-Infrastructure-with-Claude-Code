@@ -21,6 +21,7 @@ Every chapter directory is self-contained and holds both repositories, so you ne
 | ch-06   | `v0.3`  | `v0.4`   | The evolver: self-improvement, seed backport, the two-tier gap |
 | ch-07   | unchanged (`v0.3`) | unchanged (`v0.4`) | Permissions and trust: the chapter audits the posture already shipped rather than adding to it |
 | ch-08   | `v0.4`  | `v0.5`   | Observability: hooks to Loki, the activity dashboard, session cost and the continuation ladder |
+| ch-09   | `v0.5`  | `v0.6`   | Evaluation and chaos: the replay harness, action-correctness scoring, and Kaos Monkey at both levels |
 
 ## Refreshing a chapter's snapshot
 
