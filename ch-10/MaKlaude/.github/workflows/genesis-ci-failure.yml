@@ -1,0 +1,150 @@
+name: Genesis CI Failure Triage
+
+# Wake-on-failure: when a required check fails on a PR, wake the orchestrator with
+# the failure context so it can triage (re-run / fix / escalate) instead of leaving
+# the PR stuck. Auto-merge only fires on CI *success*, so without this a failing PR
+# just sits there until the human notices.
+
+on:
+  workflow_run:
+    # NOTE: must enumerate the dev system's gating workflow names. MaKlaude gates on
+    # "CI" and "E2E (kind)". (Genesis template should standardize this — see backlog.)
+    workflows:
+      - "CI"
+      - "E2E (kind)"
+    types: [completed]
+
+permissions:
+  contents: write
+  issues: write
+  pull-requests: write
+
+jobs:
+  triage:
+    # The gate is `if:`, and it MUST be evaluated before the concurrency group is
+    # joined — hence the group lives on this job, not on the workflow.
+    #
+    # GitHub allows only ONE pending run per concurrency group: when a newer run
+    # queues, the older pending one is cancelled. A workflow-level group is joined
+    # before any job's `if:` runs, so a run with nothing to do still occupies the
+    # single pending slot and can evict a run that has real work. That is not
+    # theoretical — it is why this workflow, the loop's wake-on-CI-failure safety
+    # net, had **0 successful runs in 157** and never once fired:
+    #
+    #   09:28:28  E2E (kind) SUCCEEDED -> triage run queued; would have skipped,
+    #                                     but sits in the one pending slot anyway
+    #   09:29:04  CI FAILED            -> triage run queued: the real one
+    #   09:31:08  next no-op queued    -> evicts the CI-failure run. Never ran.
+    #
+    # The only genuine CI failure in the repo's history was dropped by runs that
+    # would have skipped in one second. Worse, a run cancelled while *pending*
+    # starts no job, so it cannot trip the `if: failure()` escalation below — the
+    # loss is completely invisible.
+    #
+    # With the group here, a run whose `if:` is false is skipped without ever
+    # queueing, so no-op triggers stop competing. Real work still queues (correctly
+    # — this agent pushes fixes and must not race the orchestrator), and the
+    # residual case of two *real* runs colliding is covered deterministically by
+    # `issues.sh red-prs`, which re-derives failing PRs from repo state on every
+    # scheduled tick instead of depending on this event surviving.
+    concurrency:
+      group: genesis-orchestrator-${{ github.repository }}
+      cancel-in-progress: false
+    if: github.event.workflow_run.conclusion == 'failure' && github.event.workflow_run.event == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/create-github-app-token@v3
+        id: app-token
+        with:
+          app-id: ${{ secrets.GENESIS_APP_ID }}
+          private-key: ${{ secrets.GENESIS_APP_PRIVATE_KEY }}
+          permission-contents: write
+          permission-issues: write
+          permission-pull-requests: write
+          permission-workflows: write
+
+      - uses: anthropics/claude-code-action@v1
+        with:
+          # CI authenticates with ANTHROPIC_API_KEY, deliberately. Do NOT "fix" this
+          # by swapping in claude_code_oauth_token — a subscription token bills a
+          # person's subscription for unattended automation. PR #152 made exactly
+          # that swap and was reverted in 2931732; see #150 for the reasoning.
+          # No valid key exists right now, so CI is dormant on purpose and local
+          # `genesis serve` (the CLI is already authenticated, no secret needed) is
+          # the only path. If CI matters again, supply a key — don't change this.
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          github_token: ${{ steps.app-token.outputs.token }}
+          allowed_bots: "genesis-dev-bot[bot]"
+          # Reaches the activity-logging hooks in .claude/settings.json. The
+          # `settings` input MERGES with the repo's settings, so the hooks survive.
+          # Unset secrets render as empty strings and log.sh falls back to stderr.
+          settings: |
+            {
+              "env": {
+                "GENESIS_LOKI_URL": "${{ secrets.GENESIS_LOKI_URL }}",
+                "GENESIS_LOKI_USER": "${{ secrets.GENESIS_LOKI_USER }}",
+                "GENESIS_LOKI_TOKEN": "${{ secrets.GENESIS_LOKI_TOKEN }}"
+              }
+            }
+          prompt: |
+            A required check failed on a pull request.
+            - Failing workflow: ${{ github.event.workflow_run.name }}
+            - Head branch: ${{ github.event.workflow_run.head_branch }}
+            - Failed run: ${{ github.event.workflow_run.html_url }}
+
+            Run the orchestrator agent in .claude/agents/orchestrator.md, focused on TRIAGE
+            of this failure (see its "Handling failures" section):
+            1. Find the PR for branch "${{ github.event.workflow_run.head_branch }}". Read the failing run's logs first (`gh run view <id> --log-failed`) — the App now has actions:read so this works (genesis #14/#17 track the remaining scaffold-YAML gap). Only if you actually hit HTTP 403 (a regression), do not retry; diagnose from readable signals (gh pr checks, statusCheckRollup, the workflow YAML, the PR diff, failure cadence). See orchestrator.md "Handling failures" step 1.
+            2. Classify: transient/infra (re-run), a small well-understood defect (fix on the PR branch and push), or large/ambiguous.
+            3. If you cannot fix it quickly and confidently within your turn budget, do NOT attempt a heroic inline fix. Escalate: comment a concise diagnosis on the PR's task issue, label it needs:human, and stop. Do not loop.
+
+            FIRST, as soon as you have classified the failure (step 2, before any
+            fix attempt), record what you intend to do:
+              bash .genesis/scripts/checkpoint.sh "what I intend to do, and why"
+            If this run later dies at max-turns, that checkpoint is the only record
+            of your reasoning a human gets. One turn, before the unbounded work.
+
+            Immediately BEFORE you merge a PR or close a task issue, re-check for
+            a human comment nothing has answered:
+              bash .genesis/scripts/issues.sh unanswered-comments
+            A comment attaching conditions to work in flight is part of that
+            work's done criteria — satisfy them, or say which you are not
+            satisfying and why, before merging. `issues.sh summary` prints the
+            same section every run, but a comment can land in the minutes
+            between the summary you read and the merge you make: on #141 that
+            window was 2m25s and two of three requested cases never shipped.
+            See #156.
+          # 60 is the orchestrator-class floor (#89, raised in #96): this runs
+          # the same agent definition as the scheduled/events orchestrators, and
+          # reading a failing run's logs then fixing on the PR branch is not
+          # obviously cheaper than a cron tick's work. Raised with the class both
+          # times, not in response to a failure here — the point of a class floor
+          # is that a runner does not have to fail first to get a workable budget.
+          claude_args: "--max-turns 60 --allowedTools Read,Write,Edit,Bash,Glob,Grep,Agent"
+
+      # Copy this run's transcript (reasoning + tool calls) off the runner
+      # before it is torn down, and BEFORE the escalation below, which renders
+      # the retention status. `always()`: a dying run's transcript is the one
+      # that matters most, and a healthy run's is the baseline it is read
+      # against. Sink is private Loki — `show_full_output` deliberately stays
+      # off, because run logs and artifacts are world-readable on this public
+      # repo. See #106 and .genesis/scripts/retain-transcript.sh.
+      - name: Retain agent transcript
+        if: always()
+        run: bash .genesis/scripts/retain-transcript.sh
+        env:
+          GENESIS_LOKI_URL: ${{ secrets.GENESIS_LOKI_URL }}
+          GENESIS_LOKI_USER: ${{ secrets.GENESIS_LOKI_USER }}
+          GENESIS_LOKI_TOKEN: ${{ secrets.GENESIS_LOKI_TOKEN }}
+
+      # Escalate a real triage-run failure to a human (only on job failure).
+      - name: Escalate on failure
+        if: failure()
+        run: bash .genesis/scripts/escalate.sh
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          GH_REPO: ${{ github.repository }}
+          WF_NAME: ${{ github.workflow }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}

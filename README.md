@@ -22,6 +22,27 @@ Every chapter directory is self-contained and holds both repositories, so you ne
 | ch-07   | unchanged (`v0.3`) | unchanged (`v0.4`) | Permissions and trust: the chapter audits the posture already shipped rather than adding to it |
 | ch-08   | `v0.4`  | `v0.5`   | Observability: hooks to Loki, the activity dashboard, session cost and the continuation ladder |
 | ch-09   | `v0.5`  | `v0.6`   | Evaluation and chaos: the replay harness, action-correctness scoring, and Kaos Monkey at both levels |
+| ch-10   | unchanged (`v0.5`) | unchanged (`v0.6`) | Memory and learning: the chapter measures how the durable store behaved rather than adding to it, so neither repo advances. Ships history bundles |
+
+## History bundles, where a chapter needs them
+
+Snapshots are plain files, which is enough to read code but not enough to measure how it
+changed. Chapter 10 measures exactly that, so `ch-10/` also carries `genesis.bundle` and
+`MaKlaude.bundle`, each cloneable offline:
+
+```bash
+git clone --branch v0.6 ch-10/MaKlaude.bundle MaKlaude-history
+```
+
+Bundles are built from the chapter's **tag**, never from `main`, so they stop where the
+chapter stops. They stay plain files rather than nested `.git` directories because git
+turns an embedded `.git` into a gitlink, and clones of this repository would then carry a
+submodule pointer with no history in it. Add one with `--with-history` (below).
+
+One wrinkle worth knowing: `git bundle` output is not byte-reproducible, so re-running a
+refresh rewrites the file even when the tag has not moved and leaves it showing as
+modified. Check `git log` inside a fresh clone of the bundle rather than the file's hash,
+and discard a no-op change with `git checkout -- <chapter>/*.bundle`.
 
 ## Refreshing a chapter's snapshot
 
@@ -30,6 +51,7 @@ Use the script. Pass the chapter and a tag for each repo. Since every chapter ca
 ```bash
 scripts/refresh-chapter.sh ch-08 --genesis v0.4 --maklaude v0.5
 scripts/refresh-chapter.sh ch-07 --genesis v0.3 --maklaude v0.4   # unchanged from ch-06
+scripts/refresh-chapter.sh ch-10 --genesis v0.5 --maklaude v0.6 --with-history
 ```
 
 Passing only one flag refreshes only that repo and leaves the other directory alone, which is handy when re-vendoring a single tree.

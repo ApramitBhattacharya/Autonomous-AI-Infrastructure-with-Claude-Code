@@ -1,0 +1,159 @@
+name: Genesis Evolver
+
+on:
+  schedule:
+    # 09:00, NOT 06:00. GitHub dispatches all of a repo's crons that share the
+    # same expression together, so `0 6 * * *` here fired in the same batch as
+    # the 6-hourly orchestrator's 06:00 tick — every single day. Both were then
+    # delayed by the same 1.5–3.5h and started within 1–21 seconds of each
+    # other (15/15 days sampled; 2026-07-27 was 2s apart). A distinct hour makes
+    # them independently dispatched, so an overlap becomes coincidence rather
+    # than a guarantee. 09:00 is the midpoint of the 06:00/12:00 orchestrator
+    # ticks, i.e. maximally far from both. See the concurrency note below.
+    - cron: '0 9 * * *'
+  workflow_dispatch: {}
+
+# The evolver mutates the repo exactly like the orchestrator does — it commits,
+# pushes branches, opens PRs and comments on issues — so it belongs in the same
+# serialization group as every other repo-mutating agent (scheduled, events,
+# ci-failure). It was the one left out, which meant two Claude sessions ran
+# fully in parallel on this repo every day: the very "two orchestrators
+# duplicating work" case this group was created to prevent.
+#
+# Trade-off, accepted deliberately: with `cancel-in-progress: false` GitHub
+# still cancels an *older pending* run when a newer one queues into the group,
+# so a queued evolver can be superseded by an orchestrator event run — silently,
+# since a run cancelled while pending never starts a job and so cannot trip the
+# `if: failure()` escalation below. That is why the cron moved too: staggering
+# turns "queues behind the orchestrator daily" into "queues rarely", which keeps
+# the supersession window small. Parallel execution is the worse failure, and
+# unlike supersession it was happening 100% of the time.
+concurrency:
+  group: genesis-orchestrator-${{ github.repository }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  issues: write
+  pull-requests: write
+
+jobs:
+  evolve:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/create-github-app-token@v3
+        id: app-token
+        with:
+          app-id: ${{ secrets.GENESIS_APP_ID }}
+          private-key: ${{ secrets.GENESIS_APP_PRIVATE_KEY }}
+          permission-contents: write
+          permission-issues: write
+          permission-pull-requests: write
+          permission-workflows: write
+
+      - uses: anthropics/claude-code-action@v1
+        with:
+          # CI authenticates with ANTHROPIC_API_KEY, deliberately. Do NOT "fix" this
+          # by swapping in claude_code_oauth_token — a subscription token bills a
+          # person's subscription for unattended automation. PR #152 made exactly
+          # that swap and was reverted in 2931732; see #150 for the reasoning.
+          # No valid key exists right now, so CI is dormant on purpose and local
+          # `genesis serve` (the CLI is already authenticated, no secret needed) is
+          # the only path. If CI matters again, supply a key — don't change this.
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          github_token: ${{ steps.app-token.outputs.token }}
+          allowed_bots: "genesis-dev-bot[bot]"
+          # Reaches the activity-logging hooks in .claude/settings.json. The
+          # `settings` input MERGES with the repo's settings, so the hooks survive.
+          # Unset secrets render as empty strings and log.sh falls back to stderr.
+          settings: |
+            {
+              "env": {
+                "GENESIS_LOKI_URL": "${{ secrets.GENESIS_LOKI_URL }}",
+                "GENESIS_LOKI_USER": "${{ secrets.GENESIS_LOKI_USER }}",
+                "GENESIS_LOKI_TOKEN": "${{ secrets.GENESIS_LOKI_TOKEN }}"
+              }
+            }
+          prompt: |
+            Run the evolver agent defined in .claude/agents/evolver.md.
+            This is a scheduled review cycle — review recent system behavior and apply improvements.
+
+            FIRST, as soon as you know what you intend to do this cycle (right after
+            collecting signals, before any implementation), record it:
+              bash .genesis/scripts/checkpoint.sh "what I intend to do, and why"
+            If this run later dies at max-turns, that checkpoint is the only record
+            of your reasoning a human gets. One turn, before the unbounded work.
+            This runner has died with NO artifact at all (#85) — the checkpoint is
+            what makes that case say something instead of nothing.
+
+            Immediately BEFORE you merge a PR or close a task issue, re-check for
+            a human comment nothing has answered:
+              bash .genesis/scripts/issues.sh unanswered-comments
+            A comment attaching conditions to work in flight is part of that
+            work's done criteria — satisfy them, or say which you are not
+            satisfying and why, before merging. `issues.sh summary` prints the
+            same section every run, but a comment can land in the minutes
+            between the summary you read and the merge you make: on #141 that
+            window was 2m25s and two of three requested cases never shipped.
+            See #156.
+          # The evolver runs the broadest open-ended work of any agent: a full
+          # system review (collect signals → classify → apply fixes → escalate →
+          # curate memory) that also dispatches subagents via the Agent tool —
+          # each of which consumes turns from this budget. 15 turns (tied with the
+          # narrow merge agent for the lowest budget) was too tight and the run
+          # hit max-turns daily (escalations on #38, Jun 22–24), so it went to 30.
+          #
+          # 30 then proved too tight in turn: run 30194200792 died at turn 31
+          # having produced NO artifact at all — no branch, no PR, no issue, no
+          # comment (#85). That is the most costly failure mode in the system,
+          # because a silent evolver means the self-improvement loop has stopped
+          # and nothing says so.
+          #
+          # 45 then failed the same way: run 30254684025 died at turn 46 (#96)
+          # seconds after PR #95 merged and its #81 comment posted — the full
+          # cycle (collect signals → classify → apply a fix → escalate → curate
+          # memory) fits, the wrap-up does not. So did 60: run 30353938690 died
+          # at turn 61 (#101) after PR #100 landed, the fourth consecutive
+          # evolver failure (30, 30, 45, 60 — Jul 25–28).
+          #
+          # 60 stays anyway, and that is a decision rather than an oversight.
+          # Deaths at 40/45/60 all landed their deliverable first, which makes
+          # them evidence about the unbounded implementation task the run chose,
+          # not about the budget — raise #7 would fail the same way. The floor's
+          # only job is to clear the budgets that died *before* delivering
+          # (20, 20, 30 — #38, #80, #85), which 60 does comfortably. The two
+          # lists are split in test/devsystem/workflows_test.go so a future death
+          # gets filed by class instead of reflexively raising this number; see
+          # #97 and .genesis/design/agent-turn-budgets.md.
+          claude_args: "--max-turns 60 --allowedTools Read,Write,Edit,Bash,Glob,Grep,Agent"
+
+      # Copy this run's transcript (reasoning + tool calls) off the runner
+      # before it is torn down, and BEFORE the escalation below, which renders
+      # the retention status. `always()`: a dying run's transcript is the one
+      # that matters most, and a healthy run's is the baseline it is read
+      # against. Sink is private Loki — `show_full_output` deliberately stays
+      # off, because run logs and artifacts are world-readable on this public
+      # repo. See #106 and .genesis/scripts/retain-transcript.sh.
+      - name: Retain agent transcript
+        if: always()
+        run: bash .genesis/scripts/retain-transcript.sh
+        env:
+          GENESIS_LOKI_URL: ${{ secrets.GENESIS_LOKI_URL }}
+          GENESIS_LOKI_USER: ${{ secrets.GENESIS_LOKI_USER }}
+          GENESIS_LOKI_TOKEN: ${{ secrets.GENESIS_LOKI_TOKEN }}
+
+      # Escalate a real run failure (e.g. agent hit max-turns) to a human. Without
+      # this, an evolver failure is silent — nobody learns the self-improvement
+      # loop has stopped. Mirrors the orchestrator/merge/events/ci-failure
+      # workflows; escalate.sh dedups per-workflow, so this workflow's failures
+      # accrue to their own issue rather than conflating with other workflows'.
+      - name: Escalate on failure
+        if: failure()
+        run: bash .genesis/scripts/escalate.sh
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          GH_REPO: ${{ github.repository }}
+          WF_NAME: ${{ github.workflow }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}

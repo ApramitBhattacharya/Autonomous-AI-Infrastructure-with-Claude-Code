@@ -14,7 +14,7 @@
 set -euo pipefail
 
 usage() {
-    echo "usage: $0 <ch-NN> [--genesis TAG] [--maklaude TAG]" >&2
+    echo "usage: $0 <ch-NN> [--genesis TAG] [--maklaude TAG] [--with-history]" >&2
     exit 2
 }
 
@@ -31,6 +31,7 @@ while [ $# -gt 0 ]; do
     case "$1" in
         --genesis)  GENESIS_TAG="${2:-}"; shift 2 ;;
         --maklaude) MAKLAUDE_TAG="${2:-}"; shift 2 ;;
+        --with-history) WITH_HISTORY=1; shift ;;
         *) echo "unknown argument: $1" >&2; usage ;;
     esac
 done
@@ -67,6 +68,38 @@ vendor() {
     mkdir -p "$dest"
     git -C "$src" archive "$tag" | tar -x -C "$dest"
     echo "$name $tag -> $dest ($(find "$dest" -type f | wc -l | tr -d ' ') files)"
+
+    # Optional: ship the revision history as a bundle beside the plain files.
+    # A chapter that MEASURES how the code changed cannot be served by a flat
+    # export, because `git log` against it returns nothing. Chapter 10 is that
+    # chapter.
+    #
+    # Two details are deliberate. The bundle is built from the TAG alone, never
+    # from `main`, so it stops exactly where the chapter stops and a reader
+    # cannot accidentally read future work into a chapter's conclusions. And it
+    # stays a plain file rather than a nested `.git`: git converts an embedded
+    # `.git` into a gitlink at mode 160000, so clones of THIS repo would carry
+    # a submodule pointer and no history at all. Measured, not assumed.
+    if [ -n "${WITH_HISTORY:-}" ]; then
+        # Absolute, because `git -C "$src"` resolves a relative output path
+        # against the SOURCE repo rather than this one.
+        local bundle="$PWD/$CH/$name.bundle"
+        rm -f "$bundle"
+        git -C "$src" bundle create "$bundle" "$tag" >/dev/null 2>&1 || {
+            echo "$name: could not build a history bundle for $tag" >&2
+            exit 1
+        }
+        # Prove it before claiming it. A bundle that cannot be cloned is worse
+        # than no bundle, because the README promises a reader it works.
+        local probe
+        probe="$(mktemp -d)"
+        git clone -q --branch "$tag" "$bundle" "$probe/x" 2>/dev/null || {
+            echo "$name: the bundle for $tag does not clone; refusing to ship it" >&2
+            rm -rf "$probe"; exit 1
+        }
+        echo "$name $tag -> $bundle ($(du -h "$bundle" | cut -f1), $(git -C "$probe/x" rev-list --count HEAD) commits)"
+        rm -rf "$probe"
+    fi
 }
 
 [ -n "$GENESIS_TAG" ]  && vendor genesis  "$GENESIS_SRC"  "$GENESIS_TAG"
