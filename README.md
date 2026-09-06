@@ -39,10 +39,13 @@ chapter stops. They stay plain files rather than nested `.git` directories becau
 turns an embedded `.git` into a gitlink, and clones of this repository would then carry a
 submodule pointer with no history in it. Add one with `--with-history` (below).
 
-One wrinkle worth knowing: `git bundle` output is not byte-reproducible, so re-running a
-refresh rewrites the file even when the tag has not moved and leaves it showing as
-modified. Check `git log` inside a fresh clone of the bundle rather than the file's hash,
-and discard a no-op change with `git checkout -- <chapter>/*.bundle`.
+The bundles are byte-reproducible, so a refresh that changes nothing leaves the file
+untouched rather than showing up as a spurious diff. That takes `pack.threads=1`, which
+the script sets. By default git splits delta compression across threads and the delta
+base each object gets depends on how that partition fell, so two runs over the same
+objects emit different bytes (287,056 against 271,547 for the same 698 objects, measured
+on genesis `v0.4`). Single-threaded packing is deterministic, and it comes out slightly
+smaller besides, because one delta window sees every object.
 
 ## Refreshing a chapter's snapshot
 

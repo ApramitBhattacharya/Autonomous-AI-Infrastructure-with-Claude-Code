@@ -85,7 +85,15 @@ vendor() {
         # against the SOURCE repo rather than this one.
         local bundle="$PWD/$CH/$name.bundle"
         rm -f "$bundle"
-        git -C "$src" bundle create "$bundle" "$tag" >/dev/null 2>&1 || {
+        # pack.threads=1 makes the bundle byte-reproducible. Multi-threaded delta
+        # compression partitions the object list across threads, and which delta
+        # base each object gets depends on how that partition fell, so two runs
+        # over identical objects produce different bytes (measured: 287,056 vs
+        # 271,547 for the same 698 objects). Single-threaded, the delta search is
+        # deterministic, so re-running a refresh that changed nothing leaves the
+        # file untouched instead of showing up as a spurious diff. It also packs
+        # slightly smaller, because one delta window sees every object.
+        git -C "$src" -c pack.threads=1 bundle create "$bundle" "$tag" >/dev/null 2>&1 || {
             echo "$name: could not build a history bundle for $tag" >&2
             exit 1
         }
