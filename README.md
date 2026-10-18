@@ -1,9 +1,10 @@
 # Code Companion - *Autonomous AI Infrastructure with Claude Code*
 
-Each `ch-NN/` directory holds a frozen snapshot of the two repositories the book builds:
+Each `ch-NN/` directory holds a frozen snapshot of the repositories the book builds:
 
 - **genesis** - the bootstrapper that scaffolds autonomous dev systems.
 - **MaKlaude** - the dev system genesis bootstraps in the running example (autonomous Kubernetes operations).
+- **genesis-dashboard** - the dev system Chapter 11 bootstraps from a goal, to show the whole path on a second project. Only `ch-11/` carries it.
 
 The snapshots are vendored as **plain files (no `.git`)**, pinned to the exact version that chapter ends on, so you can read the precise code each chapter describes without checking out tags yourself.
 
@@ -11,7 +12,7 @@ The snapshots are vendored as **plain files (no `.git`)**, pinned to the exact v
 
 Each repo carries its own tag, and a chapter pins whichever tag each repo ends on. The two started in lockstep but now diverge: a chapter that only touches MaKlaude advances MaKlaude's tag while genesis stays put.
 
-Every chapter directory is self-contained and holds both repositories, so you never have to look in a different chapter to find the code. Where the table says *unchanged*, that chapter's snapshot is byte-identical to the previous one, because the chapter didn't move that repo. ch-07 is the clearest case: it audits the security posture the earlier chapters shipped rather than adding to it, so both of its trees match ch-06.
+Every chapter directory is self-contained and holds every repository that exists at that point in the book, so you never have to look in a different chapter to find the code. Where the table says *unchanged*, that chapter's snapshot is byte-identical to the previous one, because the chapter didn't move that repo. ch-07 is the clearest case: it audits the security posture the earlier chapters shipped rather than adding to it, so both of its trees match ch-06.
 
 | Chapter | genesis | MaKlaude | End state |
 |---------|---------|----------|-----------|
@@ -23,6 +24,7 @@ Every chapter directory is self-contained and holds both repositories, so you ne
 | ch-08   | `v0.4`  | `v0.5`   | Observability: hooks to Loki, the activity dashboard, session cost and the continuation ladder |
 | ch-09   | `v0.5`  | `v0.6`   | Evaluation and chaos: the replay harness, action-correctness scoring, and Kaos Monkey at both levels |
 | ch-10   | unchanged (`v0.5`) | unchanged (`v0.6`) | Memory and learning: the chapter measures how the durable store behaved rather than adding to it, so neither repo advances. Ships history bundles |
+| ch-11   | `v0.6`  | unchanged (`v0.6`) | Building your own: genesis-dashboard (`v0.1`) bootstrapped from a goal and run through milestone 1, and genesis running an evolver of its own |
 
 ## History bundles, where a chapter needs them
 
@@ -49,19 +51,20 @@ smaller besides, because one delta window sees every object.
 
 ## Refreshing a chapter's snapshot
 
-Use the script. Pass the chapter and a tag for each repo. Since every chapter carries both, an unchanged repo takes the same tag as the previous chapter:
+Use the script. Pass the chapter and a tag for each repo. Since every chapter carries all of its repos, an unchanged repo takes the same tag as the previous chapter:
 
 ```bash
 scripts/refresh-chapter.sh ch-08 --genesis v0.4 --maklaude v0.5
 scripts/refresh-chapter.sh ch-07 --genesis v0.3 --maklaude v0.4   # unchanged from ch-06
 scripts/refresh-chapter.sh ch-10 --genesis v0.5 --maklaude v0.6 --with-history
+scripts/refresh-chapter.sh ch-11 --genesis v0.6 --maklaude v0.6 --dashboard v0.1
 ```
 
 Passing only one flag refreshes only that repo and leaves the other directory alone, which is handy when re-vendoring a single tree.
 
-It exports with `git archive`, so the snapshot carries tracked files only: no `.git`, no ignored credentials, no local scratch. It reads local clones at `~/git/genesis` and `~/git/MaKlaude`, overridable with `GENESIS_SRC` and `MAKLAUDE_SRC`, and it refuses to vendor a tag that hasn't been pushed, since a local-only tag would leave the snapshot unreproducible for anyone reading the book.
+It exports with `git archive`, so the snapshot carries tracked files only: no `.git`, no ignored credentials, no local scratch. It reads local clones at `~/git/genesis`, `~/git/MaKlaude` and `~/git/genesis-dashboard`, overridable with `GENESIS_SRC`, `MAKLAUDE_SRC` and `DASHBOARD_SRC`, and it refuses to vendor a tag that hasn't been pushed, since a local-only tag would leave the snapshot unreproducible for anyone reading the book.
 
-Both source repos are public: `Sayfan-AI/genesis` and `Sayfan-AI/MaKlaude`. Without local clones, clone the tag first and point the script at it:
+All three source repos are public: `Sayfan-AI/genesis`, `Sayfan-AI/MaKlaude` and `Sayfan-AI/genesis-dashboard`. Without local clones, clone the tag first and point the script at it:
 
 ```bash
 git clone --branch v0.5 https://github.com/Sayfan-AI/MaKlaude.git /tmp/MaKlaude
@@ -72,4 +75,4 @@ MAKLAUDE_SRC=/tmp/MaKlaude scripts/refresh-chapter.sh ch-08 --maklaude v0.5
 
 - Snapshots are vendored as plain files, not git submodules, so the companion stays readable, offline, and pinned.
 - The nested `.github/workflows/` inside each snapshot never run. GitHub Actions only executes workflows at a repository's own root, not in vendored copies.
-- No secrets are included. The export carries only tracked files, and both repos gitignore their credentials (App private keys, tokens, central `.env`).
+- No secrets are included. The export carries only tracked files. genesis and MaKlaude gitignore their credentials (App private keys, tokens, central `.env`), and genesis-dashboard keeps its token in browser memory and never writes one.

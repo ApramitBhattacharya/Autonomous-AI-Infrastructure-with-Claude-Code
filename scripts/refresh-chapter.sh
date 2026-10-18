@@ -1,25 +1,28 @@
 #!/usr/bin/env bash
-# Vendor a chapter's frozen snapshots from the two source repos.
+# Vendor a chapter's frozen snapshots from the source repos.
 #
 #   scripts/refresh-chapter.sh ch-08 --genesis v0.4 --maklaude v0.5
 #   scripts/refresh-chapter.sh ch-05 --maklaude v0.3
+#   scripts/refresh-chapter.sh ch-11 --genesis v0.6 --maklaude v0.6 --dashboard v0.1
 #
 # Omit a repo's flag when the chapter left that repo untouched. Its directory is
 # then left exactly as it is, which for a chapter that never had one means the
 # reader falls back to the most recent chapter that did change it.
 #
-# Source trees default to ~/git/genesis and ~/git/MaKlaude. Override with
-# GENESIS_SRC and MAKLAUDE_SRC. Uses `git archive`, so the export carries tracked
+# Source trees default to ~/git/genesis, ~/git/MaKlaude and ~/git/genesis-dashboard.
+# Override with GENESIS_SRC, MAKLAUDE_SRC and DASHBOARD_SRC. genesis-dashboard is
+# the dev system Chapter 11 builds, so only ch-11 onward carries it. Uses `git archive`, so the export carries tracked
 # files only: no `.git`, no ignored credentials, no local scratch.
 set -euo pipefail
 
 usage() {
-    echo "usage: $0 <ch-NN> [--genesis TAG] [--maklaude TAG] [--with-history]" >&2
+    echo "usage: $0 <ch-NN> [--genesis TAG] [--maklaude TAG] [--dashboard TAG] [--with-history]" >&2
     exit 2
 }
 
 GENESIS_SRC="${GENESIS_SRC:-$HOME/git/genesis}"
 MAKLAUDE_SRC="${MAKLAUDE_SRC:-$HOME/git/MaKlaude}"
+DASHBOARD_SRC="${DASHBOARD_SRC:-$HOME/git/genesis-dashboard}"
 
 CH="${1:-}"
 [ -n "$CH" ] || usage
@@ -27,17 +30,19 @@ shift
 
 GENESIS_TAG=""
 MAKLAUDE_TAG=""
+DASHBOARD_TAG=""
 while [ $# -gt 0 ]; do
     case "$1" in
         --genesis)  GENESIS_TAG="${2:-}"; shift 2 ;;
         --maklaude) MAKLAUDE_TAG="${2:-}"; shift 2 ;;
+        --dashboard) DASHBOARD_TAG="${2:-}"; shift 2 ;;
         --with-history) WITH_HISTORY=1; shift ;;
         *) echo "unknown argument: $1" >&2; usage ;;
     esac
 done
 
-[ -n "$GENESIS_TAG" ] || [ -n "$MAKLAUDE_TAG" ] || {
-    echo "nothing to do: pass --genesis and/or --maklaude" >&2
+[ -n "$GENESIS_TAG" ] || [ -n "$MAKLAUDE_TAG" ] || [ -n "$DASHBOARD_TAG" ] || {
+    echo "nothing to do: pass --genesis, --maklaude and/or --dashboard" >&2
     exit 2
 }
 
@@ -112,6 +117,7 @@ vendor() {
 
 [ -n "$GENESIS_TAG" ]  && vendor genesis  "$GENESIS_SRC"  "$GENESIS_TAG"
 [ -n "$MAKLAUDE_TAG" ] && vendor MaKlaude "$MAKLAUDE_SRC" "$MAKLAUDE_TAG"
+[ -n "$DASHBOARD_TAG" ] && vendor genesis-dashboard "$DASHBOARD_SRC" "$DASHBOARD_TAG"
 
 # Belt and suspenders on the two things that would be embarrassing in a public
 # companion repo: a nested .git, and a credential the source repo forgot to

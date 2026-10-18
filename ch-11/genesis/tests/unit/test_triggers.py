@@ -1,0 +1,216 @@
+"""Tests for the local trigger layer.
+
+Each seeded workflow is a (condition, agent) pair. Local mode disables the
+workflows, so if `serve` doesn't reproduce the pairs, the dev system silently
+loses capabilities by being driven from a laptop instead of from CI.
+"""
+
+from __future__ import annotations
+
+import json
+import subprocess
+from unittest.mock import patch
+
+import pytest
+
+from genesis import triggers
+
+
+HOUR = 3600
+
+
+def test_a_fresh_checkout_runs_its_schedule_immediately() -> None:
+    """No recorded run means "long ago", not "wait a full interval". Otherwise a
+    dev system started at noon does nothing at all until six."""
+    assert triggers.scheduled_due({}, now=1000.0) is not None
+    assert triggers.evolver_due({}, now=1000.0) is not None
+
+
+def test_scheduled_orchestrator_respects_its_interval() -> None:
+    now = 100 * HOUR
+    assert triggers.scheduled_due({"scheduled": now - 5 * HOUR}, now) is None
+    due = triggers.scheduled_due({"scheduled": now - 7 * HOUR}, now)
+    assert due and due.agent.endswith("orchestrator.md")
+    assert "scheduled run" in due.prompt
+
+
+def test_evolver_is_daily_and_skipped_when_absent() -> None:
+    now = 100 * HOUR
+    assert triggers.evolver_due({"evolver": now - 20 * HOUR}, now) is None
+    assert triggers.evolver_due({"evolver": now - 30 * HOUR}, now) is not None
+    # A dev system without an evolver shouldn't burn a session on a missing file.
+    assert triggers.evolver_due({}, now, agent_exists=False) is None
+
+
+def test_corrupt_state_does_not_wedge_the_schedule() -> None:
+    for bad in ({"scheduled": "yesterday"}, {"scheduled": None}, {}):
+        assert triggers.scheduled_due(bad, now=1000.0) is not None
+
+
+def test_ci_failure_prompt_names_the_run() -> None:
+    runs = [{"name": "CI", "headBranch": "feat/x", "url": "https://example/run/9", "createdAt": "2026-08-02T01:00:00Z"}]
+    due = triggers.ci_failure_due(runs)
+    assert due and due.name == "ci-failure"
+    assert "CI" in due.prompt and "feat/x" in due.prompt and "run/9" in due.prompt
+    assert "heroic" in due.prompt  # triage, don't attempt an inline rewrite
+
+
+def test_no_failures_means_no_trigger() -> None:
+    assert triggers.ci_failure_due([]) is None
+
+
+def _gh_returns(payload) -> object:
+    def run(cmd, **kwargs):
+        return subprocess.CompletedProcess(cmd, 0, json.dumps(payload), "")
+
+    return run
+
+
+def test_failed_runs_ignores_genesis_own_workflows(monkeypatch, tmp_path) -> None:
+    """Genesis workflows escalate their own failures through escalate.sh.
+    Re-triaging them here would double-report a failure that already has an issue."""
+    monkeypatch.chdir(tmp_path)
+    triggers.ESCALATE_PATH.parent.mkdir(parents=True)
+    triggers.ESCALATE_PATH.write_text("#!/bin/bash\n")
+    monkeypatch.setattr(
+        triggers.subprocess,
+        "run",
+        _gh_returns([
+            {"name": "Genesis Evolver", "createdAt": "2026-08-02T02:00:00Z"},
+            {"name": "CI", "createdAt": "2026-08-02T01:00:00Z"},
+        ]),
+    )
+    runs = triggers.failed_runs("o/r", since_iso=None)
+    assert [r["name"] for r in runs] == ["CI"]
+
+
+def test_failed_runs_reports_genesis_workflows_where_nothing_escalates_them(
+    monkeypatch, tmp_path
+) -> None:
+    """Genesis's own repo has no escalate.sh, so its Genesis-named workflows
+    don't escalate. Filtering them there hid a red Genesis Auto-Merge on `main`
+    from the only thing polling for red runs (issue #112)."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(
+        triggers.subprocess,
+        "run",
+        _gh_returns([
+            {"name": "Genesis Auto-Merge", "createdAt": "2026-10-10T22:47:59Z"},
+            {"name": "CI", "createdAt": "2026-08-02T01:00:00Z"},
+        ]),
+    )
+    runs = triggers.failed_runs("o/r", since_iso=None)
+    assert [r["name"] for r in runs] == ["CI", "Genesis Auto-Merge"]
+
+
+def test_failed_runs_only_reports_what_is_new(monkeypatch) -> None:
+    monkeypatch.setattr(
+        triggers.subprocess,
+        "run",
+        _gh_returns([
+            {"name": "CI", "createdAt": "2026-08-02T01:00:00Z"},
+            {"name": "E2E (kind)", "createdAt": "2026-08-02T03:00:00Z"},
+        ]),
+    )
+    runs = triggers.failed_runs("o/r", since_iso="2026-08-02T02:00:00Z")
+    assert [r["name"] for r in runs] == ["E2E (kind)"]
+
+
+def _gh_failures_then_successes(failures, successes) -> object:
+    def run(cmd, **kwargs):
+        payload = successes if "success" in cmd else failures
+        return subprocess.CompletedProcess(cmd, 0, json.dumps(payload), "")
+
+    return run
+
+
+def test_failed_runs_flags_a_failure_a_later_success_fixed(monkeypatch, tmp_path) -> None:
+    """Issue #123: a red Genesis Auto-Merge on `main` went green 21 seconds
+    later, and the plane still spent a session triaging it hours afterwards.
+    A success on another branch, or an earlier one, fixes nothing."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(
+        triggers.subprocess,
+        "run",
+        _gh_failures_then_successes(
+            failures=[
+                {"name": "Genesis Auto-Merge", "headBranch": "main", "createdAt": "2026-10-10T22:47:59Z"},
+                {"name": "CI", "headBranch": "main", "createdAt": "2026-10-10T22:40:00Z"},
+                {"name": "CI", "headBranch": "feat/x", "createdAt": "2026-10-10T22:41:00Z"},
+            ],
+            successes=[
+                {"name": "Genesis Auto-Merge", "headBranch": "main", "createdAt": "2026-10-10T22:48:20Z"},
+                {"name": "CI", "headBranch": "main", "createdAt": "2026-10-10T22:30:00Z"},
+                {"name": "CI", "headBranch": "feat/y", "createdAt": "2026-10-10T23:00:00Z"},
+            ],
+        ),
+    )
+    runs = triggers.failed_runs("o/r", since_iso=None)
+    assert {(r["name"], r["headBranch"]): bool(r.get("superseded")) for r in runs} == {
+        ("Genesis Auto-Merge", "main"): True,
+        ("CI", "main"): False,
+        ("CI", "feat/x"): False,
+    }
+
+
+def test_a_broken_success_query_flags_nothing(monkeypatch) -> None:
+    """Failing open costs one triage session. Failing closed would hide a red check."""
+    failures = [{"name": "CI", "headBranch": "main", "createdAt": "2026-10-10T22:40:00Z"}]
+
+    def run(cmd, **kwargs):
+        if "success" in cmd:
+            return subprocess.CompletedProcess(cmd, 1, "", "HTTP 502")
+        return subprocess.CompletedProcess(cmd, 0, json.dumps(failures), "")
+
+    monkeypatch.setattr(triggers.subprocess, "run", run)
+    runs = triggers.failed_runs("o/r", since_iso=None)
+    assert [r.get("superseded") for r in runs] == [None]
+
+
+def test_failed_runs_survives_a_broken_gh(monkeypatch) -> None:
+    def boom(*a, **k):
+        raise OSError("gh missing")
+
+    monkeypatch.setattr(triggers.subprocess, "run", boom)
+    assert triggers.failed_runs("o/r", None) == []
+
+
+def test_open_human_gates_ignores_automation_failures(monkeypatch) -> None:
+    """Same predicate as the workflow step (issue #15): a dead run's escalation
+    means the next run may succeed, so it is not a reason to skip the cron."""
+    monkeypatch.setattr(
+        triggers.subprocess,
+        "run",
+        _gh_returns([
+            {"number": 1, "title": "Onboarding", "labels": [{"name": "needs:human"}]},
+            {"number": 2, "title": "Run died", "labels": [
+                {"name": "needs:human"}, {"name": "automation:failure"},
+            ]},
+        ]),
+    )
+    gates = triggers.open_human_gates("o/r")
+    assert [g["number"] for g in gates] == [1]
+
+
+def test_open_human_gates_reports_a_failed_query_as_unknown(monkeypatch) -> None:
+    """None, not []: the caller fails open on it, and the two must not be
+    confused with "checked, and nothing is waiting"."""
+    monkeypatch.setattr(
+        triggers.subprocess, "run",
+        lambda cmd, **k: subprocess.CompletedProcess(cmd, 1, "", "HTTP 502"),
+    )
+    assert triggers.open_human_gates("o/r") is None
+
+    def boom(*a, **k):
+        raise OSError("gh missing")
+
+    monkeypatch.setattr(triggers.subprocess, "run", boom)
+    assert triggers.open_human_gates("o/r") is None
+
+
+def test_state_roundtrip_and_unreadable_state(tmp_path) -> None:
+    p = tmp_path / ".trigger-state"
+    triggers.save_state({"scheduled": 123.0}, p)
+    assert triggers.load_state(p)["scheduled"] == 123.0
+    p.write_text("{ not json")
+    assert triggers.load_state(p) == {}

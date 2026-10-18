@@ -48,10 +48,15 @@ cd genesis   && cat README.md
 cd MaKlaude  && cat README.md
 ```
 
-A quick check that your toolchain is in order:
+A quick check that your toolchain is in order. A few genesis tests ask git what the
+repo tracks, so run them on a copy that's a git repository, which also keeps the
+snapshot clean:
 
 ```bash
-cd genesis  && uv run --no-sync pytest -q
+cp -R genesis /tmp/genesis && cd /tmp/genesis
+git init -q && git add -A
+uv sync --locked && uv run --no-sync pytest -q
+
 cd MaKlaude && go test ./...
 ```
 
